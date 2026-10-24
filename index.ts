@@ -10,15 +10,17 @@ const COOLDOWN_MS = 10_000;
 const REMINDER_MAX_ATTEMPTS = 5;
 const REMINDER_RETRY_MS = 30_000;
 
-const REMIND_USAGE = 'usage: !remind <in 10m | 2026-01-02 15:04 | 15:04> <text...>';
+const COMMAND_PREFIX = '!lulz-bot';
+
+const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10m | 2026-01-02 15:04 | 15:04> <text...>`;
 
 const HELP_TEXT = [
   'Commands:',
-  '!inspire - Random InspiroBot image',
-  '!catfact - Random cat fact',
-  '!meow - Random meow from 7w1 s api',
-  '!remind <when> <text> - Post a reminder in this room. <when>: 10m, in 2h30m, 1d, 15:04 or 2026-01-02 15:04 (times are UTC)',
-  '!help - Show this message',
+  `${COMMAND_PREFIX} inspire - random InspiroBot image`,
+  `${COMMAND_PREFIX} catfact - random cat fact`,
+  `${COMMAND_PREFIX} meow - random meow from the configured Meow service`,
+  `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: 10m, in 2h30m, 1d, 15:04 or 2026-01-02 15:04 (times are UTC)`,
+  `${COMMAND_PREFIX} help - show this message`,
 ].join('\n');
 
 const lastUse = new Map<string, number>();
@@ -263,14 +265,15 @@ export class MatrixBot extends MatrixBotDO {
   protected override async onMessage(message: BotMessage): Promise<void> {
     if (message.msgtype !== 'm.text') return;
 
-    const [head = '', ...args] = (message.body ?? '').trim().split(/\s+/);
-    const command = head.toLowerCase();
-    if (args.length > 0 && command !== '!remind') return;
+    const [prefix = '', subcommand = '', ...args] = (message.body ?? '').trim().split(/\s+/);
+    if (prefix.toLowerCase() !== COMMAND_PREFIX) return;
+    const command = subcommand.toLowerCase();
+    if (args.length > 0 && command !== 'remind') return;
 
     const { roomId } = message;
     const threadId = message.threadRootId;
 
-    if (command === '!inspire') {
+    if (command === 'inspire') {
       if (!acquireCooldown(roomId)) return;
       try {
         const image = await fetchInspiroImage();
@@ -291,16 +294,16 @@ export class MatrixBot extends MatrixBotDO {
     const env = this.env as unknown as Env;
     let run: () => string | Promise<string>;
     switch (command) {
-      case '!help':
+      case 'help':
         run = () => HELP_TEXT;
         break;
-      case '!catfact':
+      case 'catfact':
         run = fetchCatFact;
         break;
-      case '!meow':
+      case 'meow':
         run = () => fetchMeow(env.MEOW_BASE_URL);
         break;
-      case '!remind':
+      case 'remind':
         run = () => createReminder(env, roomId, threadId ?? null, args);
         break;
       default:
