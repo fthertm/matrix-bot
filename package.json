@@ -1,0 +1,23 @@
+{
+  "name": "matrix-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "@ixo/matrix-bot-workers-sdk": "0.7.0",
+    "matrix-js-sdk": "42.2.0"
+  },
+  "overrides": {
+    "matrix-js-sdk": "42.2.0"
+  },
+  "resolutions": {
+    "matrix-js-sdk": "42.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "wrangler": "^4.125.0"
+  }
+}

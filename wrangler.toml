@@ -1,0 +1,38 @@
+name = "matrix-bot"
+main = "index.ts"
+compatibility_date = "2026-07-15"
+compatibility_flags = ["nodejs_compat"]
+
+[alias]
+"@matrix-org/matrix-sdk-crypto-wasm" = "@ixo/matrix-bot-workers-sdk/crypto-wasm-shim"
+
+[observability]
+enabled = true
+
+[vars]
+MATRIX_HOMESERVER_URL = "https://matrix.federated.nexus"
+MATRIX_USER_ID = "@lulz:federated.nexus"
+MATRIX_DEVICE_DISPLAY_NAME = "matrix-bot"
+MATRIX_PROVISION_CRYPTO = "true"
+MATRIX_BACKFILL_MAX_EVENTS = "20"
+LOG_LEVEL = "debug"
+MEOW_BASE_URL = ""
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[durable_objects.bindings]]
+name = "BOT_DO"
+class_name = "MatrixBot"
+
+[[durable_objects.bindings]]
+name = "REMINDER_DO"
+class_name = "ReminderStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["MatrixBot"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ReminderStore"]
