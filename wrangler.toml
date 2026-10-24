@@ -2,6 +2,7 @@ name = "matrix-bot"
 main = "index.ts"
 compatibility_date = "2026-07-15"
 compatibility_flags = ["nodejs_compat"]
+workers_dev= false
 
 [alias]
 "@matrix-org/matrix-sdk-crypto-wasm" = "@ixo/matrix-bot-workers-sdk/crypto-wasm-shim"
@@ -16,7 +17,7 @@ MATRIX_DEVICE_DISPLAY_NAME = "matrix-bot"
 MATRIX_PROVISION_CRYPTO = "true"
 MATRIX_BACKFILL_MAX_EVENTS = "20"
 LOG_LEVEL = "debug"
-MEOW_BASE_URL = ""
+MEOW_BASE_URL = "https://meow.plz.pet/"
 
 [triggers]
 crons = ["*/5 * * * *"]
