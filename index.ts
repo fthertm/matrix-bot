@@ -10,7 +10,7 @@ const COOLDOWN_MS = 10_000;
 const REMINDER_MAX_ATTEMPTS = 5;
 const REMINDER_RETRY_MS = 30_000;
 
-const COMMAND_PREFIX = '!lulz-bot';
+const COMMAND_PREFIX = '!lulzbot';
 
 const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10m | 2026-01-02 15:04 | 15:04> <text...>`;
 
