@@ -14,11 +14,11 @@ const REMIND_USAGE = 'usage: !remind <in 10m | 2026-01-02 15:04 | 15:04> <text..
 
 const HELP_TEXT = [
   'Commands:',
-  '!inspire - random InspiroBot image',
-  '!catfact - random cat fact',
-  '!meow - random meow from the configured Meow service',
-  '!remind <when> <text> - post a reminder in this room. <when>: 10m, in 2h30m, 1d, 15:04 or 2026-01-02 15:04 (times are UTC)',
-  '!help - show this message',
+  '!inspire - Random InspiroBot image',
+  '!catfact - Random cat fact',
+  '!meow - Random meow from 7w1 s api',
+  '!remind <when> <text> - Post a reminder in this room. <when>: 10m, in 2h30m, 1d, 15:04 or 2026-01-02 15:04 (times are UTC)',
+  '!help - Show this message',
 ].join('\n');
 
 const lastUse = new Map<string, number>();
