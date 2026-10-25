@@ -9,8 +9,12 @@ const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const COOLDOWN_MS = 1_000;
 const REMINDER_MAX_ATTEMPTS = 5;
 const REMINDER_RETRY_MS = 10_000;
+const CLEAR_PAGE_SIZE = 100;
+const RATE_LIMIT_MAX_RETRIES = 10;
+const RATE_LIMIT_DEFAULT_WAIT_MS = 5_000;
 
-const ALLOWED_INVITERS = new Set([
+// Matrix user IDs that may invite the bot and mute/unmute it.
+const BOT_ADMINS = new Set([
   '@fatih:federated.nexus',
   '@usr40k:usr40k.dev',
 ]);
@@ -24,18 +28,27 @@ const HELP_TEXT = [
   `${COMMAND_PREFIX} inspire - random inspiring image`,
   `${COMMAND_PREFIX} catfact - random cat fact`,
   `${COMMAND_PREFIX} meow - random meow from 7w1 s meow api`,
-  `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: 10m, in 2h30m, 1d, 15:04 or 2026-01-02 15:04 (times are UTC)`,
+  `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: 2026-01-02 15:04 (times are UTC)`,
   `${COMMAND_PREFIX} help - show this message`,
 ].join('\n');
 
 const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind']);
 
+// Durable Object storage key prefix for per-room mute flags.
+const MUTE_KEY_PREFIX = 'faith:muted:';
+
 const lastUse = new Map<string, number>();
+const clearing = new Set<string>();
 
 interface InspiroImage {
   bytes: Uint8Array;
   mimetype: string;
   filename: string;
+}
+
+interface MessagesPage {
+  chunk?: { event_id: string; unsigned?: { redacted_because?: unknown } }[];
+  end?: string;
 }
 
 function errorMessage(error: unknown): string {
@@ -47,6 +60,15 @@ function acquireCooldown(roomId: string): boolean {
   if (now - (lastUse.get(roomId) ?? 0) < COOLDOWN_MS) return false;
   lastUse.set(roomId, now);
   return true;
+}
+
+async function isRoomMuted(storage: DurableObjectStorage, roomId: string): Promise<boolean> {
+  return (await storage.get<boolean>(MUTE_KEY_PREFIX + roomId)) === true;
+}
+
+async function setRoomMuted(storage: DurableObjectStorage, roomId: string, muted: boolean): Promise<void> {
+  if (muted) await storage.put(MUTE_KEY_PREFIX + roomId, true);
+  else await storage.delete(MUTE_KEY_PREFIX + roomId);
 }
 
 async function fetchInspiroImage(): Promise<InspiroImage> {
@@ -186,6 +208,51 @@ async function fetchMeow(baseUrl: string | undefined): Promise<string> {
   }
 }
 
+async function matrixRequest<T>(url: string, init: RequestInit): Promise<T | null> {
+  for (let attempt = 0; ; attempt++) {
+    const response = await fetch(url, init);
+    if (response.status === 429 && attempt < RATE_LIMIT_MAX_RETRIES) {
+      const { retry_after_ms } = (await response.json().catch(() => ({}))) as { retry_after_ms?: number };
+      await new Promise((resolve) => setTimeout(resolve, retry_after_ms ?? RATE_LIMIT_DEFAULT_WAIT_MS));
+      continue;
+    }
+    if (!response.ok) {
+      await response.body?.cancel();
+      return null;
+    }
+    return (await response.json()) as T;
+  }
+}
+
+async function deleteBotMessages(baseUrl: string, accessToken: string, userId: string, roomId: string): Promise<void> {
+  const headers = { Authorization: `Bearer ${accessToken}` };
+  const roomPath = `${baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}`;
+  const filter = encodeURIComponent(
+    JSON.stringify({ senders: [userId], types: ['m.room.message', 'm.room.encrypted'] }),
+  );
+
+  let from: string | undefined;
+  do {
+    const cursor = from ? `&from=${encodeURIComponent(from)}` : '';
+    const page = await matrixRequest<MessagesPage>(
+      `${roomPath}/messages?dir=b&limit=${CLEAR_PAGE_SIZE}&filter=${filter}${cursor}`,
+      { headers },
+    );
+    if (!page) return;
+
+    const events = page.chunk ?? [];
+    for (const event of events) {
+      if (event.unsigned?.redacted_because) continue;
+      await matrixRequest(`${roomPath}/redact/${encodeURIComponent(event.event_id)}/${crypto.randomUUID()}`, {
+        method: 'PUT',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+    }
+    from = events.length > 0 && page.end !== from ? page.end : undefined;
+  } while (from);
+}
+
 async function createReminder(env: Env, roomId: string, threadId: string | null, args: string[]): Promise<string> {
   if (args.length < 2) return REMIND_USAGE;
 
@@ -265,26 +332,39 @@ export class ReminderStore extends DurableObject<Env> {
 
 export class MatrixBot extends MatrixBotDO {
   protected override async onInvite(roomId: string, inviterId: string): Promise<boolean> {
-    if (!ALLOWED_INVITERS.has(inviterId)) {
+    if (!BOT_ADMINS.has(inviterId)) {
       console.log(`Rejected invite to ${roomId} from unauthorized user: ${inviterId}`);
       return false; // Tells the bot not to accept/join
     }
     console.log(`Accepted invite to ${roomId} from trusted user: ${inviterId}`);
     return true; // Proceed to join
   }
-
   // Alternatively, if the bot auto-joins and you need to kick/leave unauthorized rooms:
   protected override async onRoomJoin(roomId: string, inviterId?: string): Promise<void> {
     // If inviter info is available upon joining:
-    if (inviterId && !ALLOWED_INVITERS.has(inviterId)) {
+    if (inviterId && !BOT_ADMINS.has(inviterId)) {
       console.log(`Joined unauthorized room ${roomId} invited by ${inviterId}. Leaving...`);
       await this.leaveRoom(roomId);
       return;
     }
   }
+
   async deliverReminder(roomId: string, threadId: string | null, text: string): Promise<void> {
     await this.ensureStarted();
     await this.sendNotice(roomId, `\u23f0 reminder: ${text}`, { threadId: threadId ?? undefined });
+  }
+
+  private async clearRoom(roomId: string): Promise<void> {
+    if (clearing.has(roomId)) return;
+    clearing.add(roomId);
+    try {
+      const userId = this.client.getUserId();
+      const accessToken = this.client.getAccessToken();
+      if (!userId || !accessToken) return;
+      await deleteBotMessages(this.client.getHomeserverUrl().replace(/\/+$/, ''), accessToken, userId, roomId);
+    } finally {
+      clearing.delete(roomId);
+    }
   }
 
   protected override async onMessage(message: BotMessage): Promise<void> {
@@ -297,8 +377,24 @@ export class MatrixBot extends MatrixBotDO {
     const { roomId } = message;
     const threadId = message.threadRootId;
 
+    // Admin-only mute switch. Handled before the cooldown and mute checks so it always
+    // works, even while the room is being spammed.
+    if (command === 'mute' || command === 'unmute') {
+      if (!BOT_ADMINS.has(message.sender)) return;
+      await setRoomMuted(this.ctx.storage, roomId, command === 'mute');
+      return;
+    }
+
+    if (command === 'clear') {
+      if (BOT_ADMINS.has(message.sender)) await this.clearRoom(roomId).catch(() => undefined);
+      return;
+    }
+
     // Single cooldown for every command: at most one reply per room per second.
     if (!acquireCooldown(roomId)) return;
+
+    // Muted rooms get no replies at all.
+    if (await isRoomMuted(this.ctx.storage, roomId)) return;
 
     // Bare "!faith" or a mistyped/unknown subcommand: show the help text.
     if (!KNOWN_COMMANDS.has(command)) {
