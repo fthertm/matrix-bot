@@ -476,6 +476,7 @@ interface Env {
   MATRIX_RECOVERY_PASSPHRASE?: string;
   MATRIX_RECOVERY_KEY?: string;
   MEOW_BASE_URL?: string;
+  ASSETS: Fetcher;
 }
 
 function getBot(env: Env) {
