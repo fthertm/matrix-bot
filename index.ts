@@ -18,6 +18,7 @@ const RATE_LIMIT_DEFAULT_WAIT_MS = 1_000;
 const BOT_ADMINS = new Set([
   '@fatih:federated.nexus',
   '@usr40k:usr40k.dev',
+  '@angeline:matrix.anarchists.space',
 ]);
 
 const COMMAND_PREFIX = '!faith';
@@ -41,6 +42,8 @@ const MUTE_KEY_PREFIX = 'faith:muted:';
 
 const lastUse = new Map<string, number>();
 const clearing = new Set<string>();
+const approvedRooms = new Set<string>();
+let enforcingRoomPolicy = false;
 
 interface InspiroImage {
   bytes: Uint8Array;
@@ -94,7 +97,7 @@ async function fetchInspiroImage(): Promise<InspiroImage> {
 }
 
 async function fetchBunbunImage(assets: Fetcher): Promise<InspiroImage> {
-  const n = Math.floor(Math.random() * BUNBUN_COUNT) + 1; // 1..17
+  const n = Math.floor(Math.random() * BUNBUN_COUNT) + 1; // 1..BUNBUN_COUNT
   const filename = `bunbun-${n}.webp`;
   // host is irrelevant, the assets binding only uses the path
   const response = await assets.fetch(`https://assets.local/${filename}`);
@@ -346,7 +349,7 @@ export class MatrixBot extends MatrixBotDO {
   protected override async shouldJoinRoom(roomId: string, inviter: string): Promise<boolean> {
     if (!BOT_ADMINS.has(inviter)) {
       console.log(`Rejected invite to ${roomId} from unauthorized user: ${inviter}`);
-      return false; // leaves the invite pending
+      return false; // declined here; enforceRoomPolicy() rejects the pending invite shortly after
     }
     console.log(`Accepted invite to ${roomId} from trusted user: ${inviter}`);
     return true;
@@ -355,6 +358,46 @@ export class MatrixBot extends MatrixBotDO {
   async deliverReminder(roomId: string, threadId: string | null, text: string): Promise<void> {
     await this.ensureStarted();
     await this.sendNotice(roomId, `\u23f0 reminder: ${text}`, { threadId: threadId ?? undefined });
+  }
+
+  protected override async onStarted(): Promise<void> {
+    await this.enforceRoomPolicy();
+  }
+
+  // Keeps the bot only in rooms an admin invited it to: rejects pending invites from
+  // non-admins and leaves joined rooms whose inviter is not an admin. When the inviter is
+  // unknown (rooms joined before the SDK recorded it), the room stays only if an admin is in it.
+  async enforceRoomPolicy(): Promise<void> {
+    if (enforcingRoomPolicy) return;
+    enforcingRoomPolicy = true;
+    try {
+      const rooms = this.ctx.storage.sql
+        .exec<{ room_id: string; membership: string; inviter: string | null }>(
+          "SELECT room_id, membership, inviter FROM bot_rooms WHERE membership IN ('join', 'invite')",
+        )
+        .toArray();
+
+      for (const { room_id: roomId, membership, inviter } of rooms) {
+        try {
+          if (inviter && BOT_ADMINS.has(inviter)) continue;
+          if (membership === 'join' && !inviter && (await this.hasAdminMember(roomId))) continue;
+          console.log(`Leaving ${roomId} (${membership}): inviter is ${inviter || 'unknown'}, not an admin`);
+          await this.leaveRoom(roomId);
+        } catch (error) {
+          console.error(`room policy check failed for ${roomId}:`, error);
+        }
+      }
+    } finally {
+      enforcingRoomPolicy = false;
+    }
+  }
+
+  private async hasAdminMember(roomId: string): Promise<boolean> {
+    if (approvedRooms.has(roomId)) return true;
+    const members = await this.getJoinedRoomMembers(roomId);
+    const found = members.some((userId) => BOT_ADMINS.has(userId));
+    if (found) approvedRooms.add(roomId);
+    return found;
   }
 
   private async clearRoom(roomId: string): Promise<void> {
@@ -518,9 +561,11 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     if (missingSecrets(env).length > 0) return;
     try {
-      await getBot(env).ensureStarted();
+      const bot = getBot(env);
+      await bot.ensureStarted();
+      await bot.enforceRoomPolicy();
     } catch (error) {
-      console.error('scheduled start failed:', error);
+      console.error('scheduled tick failed:', error);
     }
   },
 };
