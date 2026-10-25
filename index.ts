@@ -10,6 +10,11 @@ const COOLDOWN_MS = 3_000;
 const REMINDER_MAX_ATTEMPTS = 5;
 const REMINDER_RETRY_MS = 10_000;
 
+const ALLOWED_INVITERS = new Set([
+  '@fatih:federated.nexus',
+  '@usr40k:usr40k.dev',
+]);
+
 const COMMAND_PREFIX = '!faith';
 
 const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10m | 2026-01-02 15:04 | 15:04> <text...>`;
@@ -257,6 +262,24 @@ export class ReminderStore extends DurableObject<Env> {
 }
 
 export class MatrixBot extends MatrixBotDO {
+  protected override async onInvite(roomId: string, inviterId: string): Promise<boolean> {
+    if (!ALLOWED_INVITERS.has(inviterId)) {
+      console.log(`Rejected invite to ${roomId} from unauthorized user: ${inviterId}`);
+      return false; // Tells the bot not to accept/join
+    }
+    console.log(`Accepted invite to ${roomId} from trusted user: ${inviterId}`);
+    return true; // Proceed to join
+  }
+
+  // Alternatively, if the bot auto-joins and you need to kick/leave unauthorized rooms:
+  protected override async onRoomJoin(roomId: string, inviterId?: string): Promise<void> {
+    // If inviter info is available upon joining:
+    if (inviterId && !ALLOWED_INVITERS.has(inviterId)) {
+      console.log(`Joined unauthorized room ${roomId} invited by ${inviterId}. Leaving...`);
+      await this.leaveRoom(roomId);
+      return;
+    }
+  }
   async deliverReminder(roomId: string, threadId: string | null, text: string): Promise<void> {
     await this.ensureStarted();
     await this.sendNotice(roomId, `\u23f0 reminder: ${text}`, { threadId: threadId ?? undefined });
