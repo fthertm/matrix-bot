@@ -6,12 +6,13 @@ const REMINDER_INSTANCE_NAME = 'Reminders';
 const INSPIRO_API_URL = 'https://inspirobot.me/api?generate=true';
 const CATFACT_API_URL = 'https://catfact.ninja/fact';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const BUNBUN_COUNT = 16;
 const COOLDOWN_MS = 1_000;
 const REMINDER_MAX_ATTEMPTS = 5;
 const REMINDER_RETRY_MS = 10_000;
 const CLEAR_PAGE_SIZE = 100;
 const RATE_LIMIT_MAX_RETRIES = 10;
-const RATE_LIMIT_DEFAULT_WAIT_MS = 5_000;
+const RATE_LIMIT_DEFAULT_WAIT_MS = 1_000;
 
 // Matrix user IDs that may invite the bot and mute/unmute it.
 const BOT_ADMINS = new Set([
@@ -29,10 +30,11 @@ const HELP_TEXT = [
   `${COMMAND_PREFIX} catfact - random cat fact`,
   `${COMMAND_PREFIX} meow - random meow from 7w1 s meow api`,
   `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: 2026-01-02 15:04 (times are UTC)`,
+  `${COMMAND_PREFIX} bunbun - random bunbun image`,
   `${COMMAND_PREFIX} help - show this message`,
 ].join('\n');
 
-const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind']);
+const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind', 'bunbun']);
 
 // Durable Object storage key prefix for per-room mute flags.
 const MUTE_KEY_PREFIX = 'faith:muted:';
@@ -89,6 +91,16 @@ async function fetchInspiroImage(): Promise<InspiroImage> {
 
   const extension = mimetype === 'image/png' ? 'png' : 'jpg';
   return { bytes, mimetype, filename: `inspirobot.${extension}` };
+}
+
+async function fetchBunbunImage(assets: Fetcher): Promise<InspiroImage> {
+  const n = Math.floor(Math.random() * BUNBUN_COUNT) + 1; // 1..17
+  const filename = `bunbun-${n}.webp`;
+  // host is irrelevant, the assets binding only uses the path
+  const response = await assets.fetch(`https://assets.local/${filename}`);
+  if (!response.ok) throw new Error(`${filename} not found: HTTP ${response.status}`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  return { bytes, mimetype: 'image/webp', filename };
 }
 
 const DAY_MS = 86_400_000;
@@ -413,6 +425,22 @@ export class MatrixBot extends MatrixBotDO {
     }
 
     const env = this.env as unknown as Env;
+    if (command === 'bunbun') {
+      try {
+        const image = await fetchBunbunImage(env.ASSETS);
+        await this.sendFile(roomId, image.bytes, {
+          filename: image.filename,
+          mimetype: image.mimetype,
+          msgtype: 'm.image',
+          body: image.filename,
+          threadId,
+        });
+      } catch (error) {
+        console.error('bunbun command failed:', error);
+        await this.sendNotice(roomId, "Couldn't fetch image.", { threadId }).catch(() => undefined);
+      }
+      return;
+    }
     let run: () => string | Promise<string>;
     switch (command) {
       case 'help':
