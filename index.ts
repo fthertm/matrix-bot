@@ -6,19 +6,19 @@ const REMINDER_INSTANCE_NAME = 'Reminders';
 const INSPIRO_API_URL = 'https://inspirobot.me/api?generate=true';
 const CATFACT_API_URL = 'https://catfact.ninja/fact';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
-const COOLDOWN_MS = 10_000;
+const COOLDOWN_MS = 3_000;
 const REMINDER_MAX_ATTEMPTS = 5;
-const REMINDER_RETRY_MS = 30_000;
+const REMINDER_RETRY_MS = 10_000;
 
-const COMMAND_PREFIX = '!lulzbot';
+const COMMAND_PREFIX = '!faith';
 
 const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10m | 2026-01-02 15:04 | 15:04> <text...>`;
 
 const HELP_TEXT = [
   'Commands:',
-  `${COMMAND_PREFIX} inspire - random InspiroBot image`,
+  `${COMMAND_PREFIX} inspire - random inspiring image`,
   `${COMMAND_PREFIX} catfact - random cat fact`,
-  `${COMMAND_PREFIX} meow - random meow from the configured Meow service`,
+  `${COMMAND_PREFIX} meow - random meow from 7w1 s meow api`,
   `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: 10m, in 2h30m, 1d, 15:04 or 2026-01-02 15:04 (times are UTC)`,
   `${COMMAND_PREFIX} help - show this message`,
 ].join('\n');
