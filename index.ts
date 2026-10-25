@@ -331,22 +331,13 @@ export class ReminderStore extends DurableObject<Env> {
 }
 
 export class MatrixBot extends MatrixBotDO {
-  protected override async onInvite(roomId: string, inviterId: string): Promise<boolean> {
-    if (!BOT_ADMINS.has(inviterId)) {
-      console.log(`Rejected invite to ${roomId} from unauthorized user: ${inviterId}`);
-      return false; // Tells the bot not to accept/join
+  protected override async shouldJoinRoom(roomId: string, inviter: string): Promise<boolean> {
+    if (!BOT_ADMINS.has(inviter)) {
+      console.log(`Rejected invite to ${roomId} from unauthorized user: ${inviter}`);
+      return false; // leaves the invite pending
     }
-    console.log(`Accepted invite to ${roomId} from trusted user: ${inviterId}`);
-    return true; // Proceed to join
-  }
-  // Alternatively, if the bot auto-joins and you need to kick/leave unauthorized rooms:
-  protected override async onRoomJoin(roomId: string, inviterId?: string): Promise<void> {
-    // If inviter info is available upon joining:
-    if (inviterId && !BOT_ADMINS.has(inviterId)) {
-      console.log(`Joined unauthorized room ${roomId} invited by ${inviterId}. Leaving...`);
-      await this.leaveRoom(roomId);
-      return;
-    }
+    console.log(`Accepted invite to ${roomId} from trusted user: ${inviter}`);
+    return true;
   }
 
   async deliverReminder(roomId: string, threadId: string | null, text: string): Promise<void> {
