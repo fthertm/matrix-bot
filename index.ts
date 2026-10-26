@@ -46,13 +46,17 @@ const clearing = new Set<string>();
 const approvedRooms = new Set<string>();
 let enforcingRoomPolicy = false;
 
-const nativeFetch = globalThis.fetch.bind(globalThis);
-globalThis.fetch = (input, init) => {
+const RECEIPT_PATH = /\/rooms\/[^/]+\/(?:receipt\/|read_markers)/;
+const patchedClients = new WeakSet<object>();
+
+function isReceiptRequest(input: Parameters<typeof fetch>[0]): boolean {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-  return /\/rooms\/[^/]+\/(?:receipt\/|read_markers)/.test(url)
-    ? Promise.resolve(Response.json({}))
-    : nativeFetch(input, init);
-};
+  return RECEIPT_PATH.test(url);
+}
+
+const nativeFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = (input, init) =>
+  isReceiptRequest(input) ? Promise.resolve(Response.json({})) : nativeFetch(input, init);
 
 interface InspiroImage {
   bytes: Uint8Array;
@@ -67,6 +71,10 @@ interface MessagesPage {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function acquireCooldown(roomId: string): boolean {
@@ -383,13 +391,35 @@ export class MatrixBot extends MatrixBotDO {
 
   async deliverReminder(roomId: string, threadId: string | null, text: string, userId: string | null): Promise<void> {
     await this.ensureStarted();
-    await this.sendNotice(roomId, `${userId ? `${userId} ` : ''}\u23f0 reminder: ${text}`, {
+    if (!userId) {
+      await this.sendNotice(roomId, `\u23f0 reminder: ${text}`, { threadId: threadId ?? undefined });
+      return;
+    }
+    const mention = escapeHtml(userId);
+    await this.sendText(roomId, `${userId} \u23f0 reminder: ${text}`, {
       threadId: threadId ?? undefined,
+      mentions: [userId],
+      formattedBody: `<a href="https://matrix.to/#/${mention}">${mention}</a> \u23f0 reminder: ${escapeHtml(text)}`,
     });
   }
 
   protected override async onStarted(): Promise<void> {
+    this.blockReadReceipts();
     await this.enforceRoomPolicy();
+  }
+
+  private blockReadReceipts(): void {
+    try {
+      const client = this.client;
+      if (!client || patchedClients.has(client)) return;
+      const options = client.http.opts as { fetchFn?: typeof fetch };
+      const upstream = options.fetchFn ?? globalThis.fetch.bind(globalThis);
+      options.fetchFn = (input, init) =>
+        isReceiptRequest(input) ? Promise.resolve(Response.json({})) : upstream(input, init);
+      patchedClients.add(client);
+    } catch (error) {
+      console.error('read receipt guard failed:', error);
+    }
   }
 
   // Keeps the bot only in rooms an admin invited it to: rejects pending invites from
@@ -442,6 +472,7 @@ export class MatrixBot extends MatrixBotDO {
   }
 
   protected override async onMessage(message: BotMessage): Promise<void> {
+    this.blockReadReceipts();
     if (message.msgtype !== 'm.text') return;
 
     const [prefix = '', subcommand = '', ...args] = (message.body ?? '').trim().split(/\s+/);
