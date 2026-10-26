@@ -19,6 +19,7 @@ const BOT_ADMINS = new Set([
   '@fatih:federated.nexus',
   '@usr40k:usr40k.dev',
   '@angeline:matrix.anarchists.space',
+  '@cj:foxnet.systems',
 ]);
 
 const COMMAND_PREFIX = '!faith';
@@ -44,6 +45,14 @@ const lastUse = new Map<string, number>();
 const clearing = new Set<string>();
 const approvedRooms = new Set<string>();
 let enforcingRoomPolicy = false;
+
+const nativeFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = (input, init) => {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  return /\/rooms\/[^/]+\/(?:receipt\/|read_markers)/.test(url)
+    ? Promise.resolve(Response.json({}))
+    : nativeFetch(input, init);
+};
 
 interface InspiroImage {
   bytes: Uint8Array;
@@ -268,7 +277,13 @@ async function deleteBotMessages(baseUrl: string, accessToken: string, userId: s
   } while (from);
 }
 
-async function createReminder(env: Env, roomId: string, threadId: string | null, args: string[]): Promise<string> {
+async function createReminder(
+  env: Env,
+  roomId: string,
+  threadId: string | null,
+  args: string[],
+  userId: string,
+): Promise<string> {
   if (args.length < 2) return REMIND_USAGE;
 
   const now = Date.now();
@@ -280,7 +295,7 @@ async function createReminder(env: Env, roomId: string, threadId: string | null,
   if (reminder.due <= now) throw new Error('that time is in the past, pick a future time');
 
   const store = env.REMINDER_DO.get(env.REMINDER_DO.idFromName(REMINDER_INSTANCE_NAME));
-  await store.schedule(roomId, threadId, reminder.due, reminder.text);
+  await store.schedule(roomId, threadId, reminder.due, reminder.text, userId);
   return `ok, I'll remind you at ${formatUtc(reminder.due)}`;
 }
 
@@ -290,17 +305,21 @@ export class ReminderStore extends DurableObject<Env> {
     ctx.storage.sql.exec(
       'CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, due INTEGER NOT NULL, room_id TEXT NOT NULL, thread_id TEXT, text TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)',
     );
+    try {
+      ctx.storage.sql.exec('ALTER TABLE reminders ADD COLUMN user_id TEXT');
+    } catch {}
   }
 
-  async schedule(roomId: string, threadId: string | null, due: number, text: string): Promise<void> {
+  async schedule(roomId: string, threadId: string | null, due: number, text: string, userId: string): Promise<void> {
     const currentAlarm = await this.ctx.storage.getAlarm();
     if (currentAlarm === null || due < currentAlarm) await this.ctx.storage.setAlarm(due);
     this.ctx.storage.sql.exec(
-      'INSERT INTO reminders (due, room_id, thread_id, text) VALUES (?, ?, ?, ?)',
+      'INSERT INTO reminders (due, room_id, thread_id, text, user_id) VALUES (?, ?, ?, ?, ?)',
       due,
       roomId,
       threadId,
       text,
+      userId,
     );
   }
 
@@ -308,8 +327,15 @@ export class ReminderStore extends DurableObject<Env> {
     const sql = this.ctx.storage.sql;
     const now = Date.now();
     const rows = sql
-      .exec<{ id: number; room_id: string; thread_id: string | null; text: string; attempts: number }>(
-        'SELECT id, room_id, thread_id, text, attempts FROM reminders WHERE due <= ? ORDER BY due',
+      .exec<{
+        id: number;
+        room_id: string;
+        thread_id: string | null;
+        text: string;
+        attempts: number;
+        user_id: string | null;
+      }>(
+        'SELECT id, room_id, thread_id, text, attempts, user_id FROM reminders WHERE due <= ? ORDER BY due',
         now,
       )
       .toArray();
@@ -317,7 +343,7 @@ export class ReminderStore extends DurableObject<Env> {
 
     for (const row of rows) {
       try {
-        await bot.deliverReminder(row.room_id, row.thread_id, row.text);
+        await bot.deliverReminder(row.room_id, row.thread_id, row.text, row.user_id);
         sql.exec('DELETE FROM reminders WHERE id = ?', row.id);
       } catch (error) {
         console.error('reminder delivery failed:', error);
@@ -355,9 +381,11 @@ export class MatrixBot extends MatrixBotDO {
     return true;
   }
 
-  async deliverReminder(roomId: string, threadId: string | null, text: string): Promise<void> {
+  async deliverReminder(roomId: string, threadId: string | null, text: string, userId: string | null): Promise<void> {
     await this.ensureStarted();
-    await this.sendNotice(roomId, `\u23f0 reminder: ${text}`, { threadId: threadId ?? undefined });
+    await this.sendNotice(roomId, `${userId ? `${userId} ` : ''}\u23f0 reminder: ${text}`, {
+      threadId: threadId ?? undefined,
+    });
   }
 
   protected override async onStarted(): Promise<void> {
@@ -496,7 +524,7 @@ export class MatrixBot extends MatrixBotDO {
         run = () => fetchMeow(env.MEOW_BASE_URL);
         break;
       case 'remind':
-        run = () => createReminder(env, roomId, threadId ?? null, args);
+        run = () => createReminder(env, roomId, threadId ?? null, args, message.sender);
         break;
       default:
         return;
