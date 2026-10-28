@@ -10,9 +10,6 @@ const BUNBUN_COUNT = 16;
 const COOLDOWN_MS = 1_000;
 const REMINDER_MAX_ATTEMPTS = 5;
 const REMINDER_RETRY_MS = 10_000;
-const CLEAR_PAGE_SIZE = 100;
-const RATE_LIMIT_MAX_RETRIES = 10;
-const RATE_LIMIT_DEFAULT_WAIT_MS = 1_000;
 
 // Matrix user IDs that may invite the bot and mute/unmute it.
 const BOT_ADMINS = new Set([
@@ -42,7 +39,6 @@ const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind', 
 const MUTE_KEY_PREFIX = 'faith:muted:';
 
 const lastUse = new Map<string, number>();
-const clearing = new Set<string>();
 const approvedRooms = new Set<string>();
 let enforcingRoomPolicy = false;
 
@@ -62,11 +58,6 @@ interface InspiroImage {
   bytes: Uint8Array;
   mimetype: string;
   filename: string;
-}
-
-interface MessagesPage {
-  chunk?: { event_id: string; unsigned?: { redacted_because?: unknown } }[];
-  end?: string;
 }
 
 function errorMessage(error: unknown): string {
@@ -238,51 +229,6 @@ async function fetchMeow(baseUrl: string | undefined): Promise<string> {
   } catch (error) {
     throw new Error(`meow service failed: ${errorMessage(error)}`);
   }
-}
-
-async function matrixRequest<T>(url: string, init: RequestInit): Promise<T | null> {
-  for (let attempt = 0; ; attempt++) {
-    const response = await fetch(url, init);
-    if (response.status === 429 && attempt < RATE_LIMIT_MAX_RETRIES) {
-      const { retry_after_ms } = (await response.json().catch(() => ({}))) as { retry_after_ms?: number };
-      await new Promise((resolve) => setTimeout(resolve, retry_after_ms ?? RATE_LIMIT_DEFAULT_WAIT_MS));
-      continue;
-    }
-    if (!response.ok) {
-      await response.body?.cancel();
-      return null;
-    }
-    return (await response.json()) as T;
-  }
-}
-
-async function deleteBotMessages(baseUrl: string, accessToken: string, userId: string, roomId: string): Promise<void> {
-  const headers = { Authorization: `Bearer ${accessToken}` };
-  const roomPath = `${baseUrl}/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}`;
-  const filter = encodeURIComponent(
-    JSON.stringify({ senders: [userId], types: ['m.room.message', 'm.room.encrypted'] }),
-  );
-
-  let from: string | undefined;
-  do {
-    const cursor = from ? `&from=${encodeURIComponent(from)}` : '';
-    const page = await matrixRequest<MessagesPage>(
-      `${roomPath}/messages?dir=b&limit=${CLEAR_PAGE_SIZE}&filter=${filter}${cursor}`,
-      { headers },
-    );
-    if (!page) return;
-
-    const events = page.chunk ?? [];
-    for (const event of events) {
-      if (event.unsigned?.redacted_because) continue;
-      await matrixRequest(`${roomPath}/redact/${encodeURIComponent(event.event_id)}/${crypto.randomUUID()}`, {
-        method: 'PUT',
-        headers: { ...headers, 'Content-Type': 'application/json' },
-        body: '{}',
-      });
-    }
-    from = events.length > 0 && page.end !== from ? page.end : undefined;
-  } while (from);
 }
 
 async function createReminder(
@@ -458,19 +404,6 @@ export class MatrixBot extends MatrixBotDO {
     return found;
   }
 
-  private async clearRoom(roomId: string): Promise<void> {
-    if (clearing.has(roomId)) return;
-    clearing.add(roomId);
-    try {
-      const userId = this.client.getUserId();
-      const accessToken = this.client.getAccessToken();
-      if (!userId || !accessToken) return;
-      await deleteBotMessages(this.client.getHomeserverUrl().replace(/\/+$/, ''), accessToken, userId, roomId);
-    } finally {
-      clearing.delete(roomId);
-    }
-  }
-
   protected override async onMessage(message: BotMessage): Promise<void> {
     this.blockReadReceipts();
     if (message.msgtype !== 'm.text') return;
@@ -487,11 +420,6 @@ export class MatrixBot extends MatrixBotDO {
     if (command === 'mute' || command === 'unmute') {
       if (!BOT_ADMINS.has(message.sender)) return;
       await setRoomMuted(this.ctx.storage, roomId, command === 'mute');
-      return;
-    }
-
-    if (command === 'clear') {
-      if (BOT_ADMINS.has(message.sender)) await this.clearRoom(roomId).catch(() => undefined);
       return;
     }
 
