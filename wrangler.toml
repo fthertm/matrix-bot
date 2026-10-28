@@ -21,7 +21,7 @@ MATRIX_USER_ID = "@lulz:federated.nexus"
 MATRIX_DEVICE_DISPLAY_NAME = "matrix-bot"
 MATRIX_PROVISION_CRYPTO = "true"
 MATRIX_BACKFILL_MAX_EVENTS = "20"
-LOG_LEVEL = "debug"
+LOG_LEVEL = "info"
 MEOW_BASE_URL = "https://meow.plz.pet/"
 
 [triggers]
