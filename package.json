@@ -8,12 +8,15 @@
   },
   "dependencies": {
     "@ixo/matrix-bot-workers-sdk": "0.7.0",
+    "fake-indexeddb": "6.2.5",
     "matrix-js-sdk": "42.2.0"
   },
   "overrides": {
+    "fake-indexeddb": "6.2.5",
     "matrix-js-sdk": "42.2.0"
   },
   "resolutions": {
+    "fake-indexeddb": "6.2.5",
     "matrix-js-sdk": "42.2.0"
   },
   "devDependencies": {
