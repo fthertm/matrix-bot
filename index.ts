@@ -21,7 +21,7 @@ const BOT_ADMINS = new Set([
 
 const COMMAND_PREFIX = '!faith';
 
-const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10m | 2026-01-02 15:04 | 15:04> <text...>`;
+const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10m | in 2 hours | in 3 days | tomorrow | 15.04 01/11/2026 | 2026-01-02 15:04 | 15:04> <text...>`;
 
 const RPS_BEATS = { rock: 'scissors', paper: 'rock', scissors: 'paper' } as const;
 type RpsChoice = keyof typeof RPS_BEATS;
@@ -38,7 +38,7 @@ const HELP_TEXT = [
   `${COMMAND_PREFIX} inspire - random inspiring image`,
   `${COMMAND_PREFIX} catfact - random cat fact`,
   `${COMMAND_PREFIX} meow - random meow from 7w1 s meow api`,
-  `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: 2026-01-02 15:04 (times are UTC)`,
+  `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: in 2 hours, in 30 minutes, in 3 days, tomorrow, 15.04 01/11/2026, 2026-01-02 15:04 (times are UTC)`,
   `${COMMAND_PREFIX} bunbun - random bunbun image`,
   `${COMMAND_PREFIX} coinflip - flip a coin`,
   `${COMMAND_PREFIX} rps <rock|paper|scissors> - play rock paper scissors against the bot`,
@@ -129,9 +129,10 @@ async function fetchBunbunImage(assets: Fetcher): Promise<InspiroImage> {
 const DAY_MS = 86_400_000;
 const MAX_TIMESTAMP = 8_640_000_000_000_000;
 const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})$/i;
-const RELATIVE_PATTERN = /^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/;
-const ABSOLUTE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2})(?::(\d{2}))?)?$/;
-const CLOCK_PATTERN = /^(\d{1,2}):(\d{2})$/;
+const RELATIVE_PATTERN =
+  /^(?:(\d+)\s*(?:days?|d))?\s*(?:(\d+)\s*(?:hours?|hrs?|h))?\s*(?:(\d+)\s*(?:minutes?|mins?|m))?\s*(?:(\d+)\s*(?:seconds?|secs?|s))?$/;
+const DATE_PATTERN = /^(?:(\d{4})-(\d{2})-(\d{2})|(\d{1,2})\/(\d{1,2})\/(\d{4}))$/;
+const CLOCK_PATTERN = /^(\d{1,2})[:.](\d{2})(?::(\d{2}))?$/;
 
 function utcTimestamp(
   year: number,
@@ -174,39 +175,46 @@ function parseWhen(input: string, now: number): number | null {
     if (total > 0 && due <= MAX_TIMESTAMP) return due;
   }
 
-  const absolute = ABSOLUTE_PATTERN.exec(value);
-  if (absolute) {
-    const [, year, month, day, hour, minute, second] = absolute;
-    return utcTimestamp(
-      Number(year),
-      Number(month),
-      Number(day),
-      Number(hour ?? 0),
-      Number(minute ?? 0),
-      Number(second ?? 0),
-    );
+  // "tomorrow", a date ("2026-01-02" or day/month/year like "01/11/2026") and/or a clock time ("15:04" or "15.04"),
+  // in any order: "15.04 01/11/2026", "tomorrow 09:00". "tomorrow" alone means the same time tomorrow.
+  let tomorrow = false;
+  let date: RegExpExecArray | null = null;
+  let clock: RegExpExecArray | null = null;
+  for (const word of value.split(/\s+/)) {
+    const dateMatch = DATE_PATTERN.exec(word);
+    const clockMatch = CLOCK_PATTERN.exec(word);
+    if (word === 'tomorrow' && !tomorrow && !date) tomorrow = true;
+    else if (dateMatch && !tomorrow && !date) date = dateMatch;
+    else if (clockMatch && !clock) clock = clockMatch;
+    else return null;
   }
 
-  const clock = CLOCK_PATTERN.exec(value);
-  if (clock) {
-    const today = new Date(now);
-    const timestamp = utcTimestamp(
-      today.getUTCFullYear(),
-      today.getUTCMonth() + 1,
-      today.getUTCDate(),
-      Number(clock[1]),
-      Number(clock[2]),
-      0,
-    );
-    if (timestamp === null) return null;
-    return timestamp > now ? timestamp : timestamp + DAY_MS;
+  const hour = Number(clock?.[1] ?? 0);
+  const minute = Number(clock?.[2] ?? 0);
+  const second = Number(clock?.[3] ?? 0);
+
+  if (date) {
+    const [year, month, day] = date[1] ? [date[1], date[2], date[3]] : [date[6], date[5], date[4]];
+    return utcTimestamp(Number(year), Number(month), Number(day), hour, minute, second);
   }
 
-  return null;
+  if (tomorrow && !clock) return now + DAY_MS;
+
+  const today = new Date(now);
+  const timestamp = utcTimestamp(
+    today.getUTCFullYear(),
+    today.getUTCMonth() + 1,
+    today.getUTCDate(),
+    hour,
+    minute,
+    second,
+  );
+  if (timestamp === null) return null;
+  return tomorrow || timestamp <= now ? timestamp + DAY_MS : timestamp;
 }
 
 function extractReminder(args: string[], now: number): { due: number; text: string } | null {
-  for (const size of [2, 1]) {
+  for (const size of [5, 4, 3, 2, 1]) {
     if (args.length < size) continue;
     const due = parseWhen(args.slice(0, size).join(' '), now);
     if (due !== null) return { due, text: args.slice(size).join(' ') };
@@ -273,7 +281,9 @@ async function createReminder(
   const now = Date.now();
   const reminder = extractReminder(args, now);
   if (!reminder) {
-    throw new Error(`couldn't parse time "${args[0]}" (try "10m", "1d", "15:04", or "2026-01-02 15:04")`);
+    throw new Error(
+      `couldn't parse time "${args[0]}" (try "in 2 hours", "tomorrow", "15.04 01/11/2026", or "2026-01-02 15:04")`,
+    );
   }
   if (!reminder.text) return REMIND_USAGE;
   if (reminder.due <= now) throw new Error('that time is in the past, pick a future time');
