@@ -23,6 +23,16 @@ const COMMAND_PREFIX = '!faith';
 
 const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10m | 2026-01-02 15:04 | 15:04> <text...>`;
 
+const RPS_BEATS = { rock: 'scissors', paper: 'rock', scissors: 'paper' } as const;
+type RpsChoice = keyof typeof RPS_BEATS;
+const RPS_CHOICES = Object.keys(RPS_BEATS) as RpsChoice[];
+const RPS_EMOJI: Record<RpsChoice, string> = {
+  rock: '\u{1FAA8}',
+  paper: '\u{1F4C4}',
+  scissors: '\u2702\uFE0F',
+};
+const RPS_USAGE = `usage: ${COMMAND_PREFIX} rps <rock|paper|scissors>`;
+
 const HELP_TEXT = [
   'Commands:',
   `${COMMAND_PREFIX} inspire - random inspiring image`,
@@ -30,10 +40,12 @@ const HELP_TEXT = [
   `${COMMAND_PREFIX} meow - random meow from 7w1 s meow api`,
   `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: 2026-01-02 15:04 (times are UTC)`,
   `${COMMAND_PREFIX} bunbun - random bunbun image`,
+  `${COMMAND_PREFIX} coinflip - flip a coin`,
+  `${COMMAND_PREFIX} rps <rock|paper|scissors> - play rock paper scissors against the bot`,
   `${COMMAND_PREFIX} help - show this message`,
 ].join('\n');
 
-const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind', 'bunbun']);
+const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind', 'bunbun', 'coinflip', 'rps']);
 
 // Durable Object storage key prefix for per-room mute flags.
 const MUTE_KEY_PREFIX = 'faith:muted:';
@@ -229,6 +241,24 @@ async function fetchMeow(baseUrl: string | undefined): Promise<string> {
   } catch (error) {
     throw new Error(`meow service failed: ${errorMessage(error)}`);
   }
+}
+
+function flipCoin(): string {
+  return Math.random() < 0.5 ? '\u{1FA99} heads' : '\u{1FA99} tails';
+}
+
+function isRpsChoice(value: string | undefined): value is RpsChoice {
+  return RPS_CHOICES.some((choice) => choice === value);
+}
+
+function playRps(args: string[]): string {
+  const playerChoice = args[0]?.toLowerCase();
+  if (args.length !== 1 || !isRpsChoice(playerChoice)) return RPS_USAGE;
+
+  const botChoice = RPS_CHOICES[Math.floor(Math.random() * RPS_CHOICES.length)];
+  const result =
+    playerChoice === botChoice ? "it's a tie!" : RPS_BEATS[playerChoice] === botChoice ? 'you win!' : 'I win!';
+  return `you: ${RPS_EMOJI[playerChoice]} ${playerChoice} | me: ${RPS_EMOJI[botChoice]} ${botChoice} - ${result}`;
 }
 
 async function createReminder(
@@ -435,7 +465,7 @@ export class MatrixBot extends MatrixBotDO {
       return;
     }
 
-    if (args.length > 0 && command !== 'remind') return;
+    if (args.length > 0 && command !== 'remind' && command !== 'rps') return;
 
     if (command === 'inspire') {
       try {
@@ -481,6 +511,12 @@ export class MatrixBot extends MatrixBotDO {
         break;
       case 'meow':
         run = () => fetchMeow(env.MEOW_BASE_URL);
+        break;
+      case 'coinflip':
+        run = flipCoin;
+        break;
+      case 'rps':
+        run = () => playRps(args);
         break;
       case 'remind':
         run = () => createReminder(env, roomId, threadId ?? null, args, message.sender);
@@ -545,12 +581,12 @@ export default {
     }
   },
 
+  // Keep-alive only: wakes the Durable Object and makes sure the bot is running.
+  // Room policy is enforced from onStarted(), not from here.
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     if (missingSecrets(env).length > 0) return;
     try {
-      const bot = getBot(env);
-      await bot.ensureStarted();
-      await bot.enforceRoomPolicy();
+      await getBot(env).ensureStarted();
     } catch (error) {
       console.error('scheduled tick failed:', error);
     }
