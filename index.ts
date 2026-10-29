@@ -10,8 +10,9 @@ const BUNBUN_COUNT = 16;
 const COOLDOWN_MS = 1_000;
 const REMINDER_MAX_ATTEMPTS = 5;
 const REMINDER_RETRY_MS = 10_000;
+const MUTE_KEY_PREFIX = 'faith:muted:';
 
-// Matrix user IDs that may invite the bot and mute/unmute it.
+// can invite the bot and mute/unmute it
 const BOT_ADMINS = new Set([
   '@fatih:federated.nexus',
   '@usr40k:usr40k.dev',
@@ -20,17 +21,9 @@ const BOT_ADMINS = new Set([
 ]);
 
 const COMMAND_PREFIX = '!faith';
+const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind', 'bunbun', 'coinflip', 'rps']);
 
-const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10m | in 2 hours | in 3 days | tomorrow | 15.04 01/11/2026 | 2026-01-02 15:04 | 15:04> <text...>`;
-
-const RPS_BEATS = { rock: 'scissors', paper: 'rock', scissors: 'paper' } as const;
-type RpsChoice = keyof typeof RPS_BEATS;
-const RPS_CHOICES = Object.keys(RPS_BEATS) as RpsChoice[];
-const RPS_EMOJI: Record<RpsChoice, string> = {
-  rock: '\u{1FAA8}',
-  paper: '\u{1F4C4}',
-  scissors: '\u2702\uFE0F',
-};
+const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10m | 2026-01-02 15:04 | 15:04> <text...>`;
 const RPS_USAGE = `usage: ${COMMAND_PREFIX} rps <rock|paper|scissors>`;
 
 const HELP_TEXT = [
@@ -38,35 +31,29 @@ const HELP_TEXT = [
   `${COMMAND_PREFIX} inspire - random inspiring image`,
   `${COMMAND_PREFIX} catfact - random cat fact`,
   `${COMMAND_PREFIX} meow - random meow from 7w1 s meow api`,
-  `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: in 2 hours, in 30 minutes, in 3 days, tomorrow, 15.04 01/11/2026, 2026-01-02 15:04 (times are UTC)`,
+  `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: 2026-01-02 15:04 (times are UTC)`,
   `${COMMAND_PREFIX} bunbun - random bunbun image`,
   `${COMMAND_PREFIX} coinflip - flip a coin`,
   `${COMMAND_PREFIX} rps <rock|paper|scissors> - play rock paper scissors against the bot`,
   `${COMMAND_PREFIX} help - show this message`,
 ].join('\n');
 
-const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind', 'bunbun', 'coinflip', 'rps']);
+const RPS_CHOICES = ['rock', 'paper', 'scissors'];
+const RPS_EMOJI = ['🪨', '📄', '✂️'];
 
-// Durable Object storage key prefix for per-room mute flags.
-const MUTE_KEY_PREFIX = 'faith:muted:';
+// the bot never sends read receipts, those requests are answered locally
+const RECEIPT_PATH = /\/rooms\/[^/]+\/(?:receipt\/|read_markers)/;
+const realFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = (input, init) => {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  return RECEIPT_PATH.test(url) ? Promise.resolve(Response.json({})) : realFetch(input, init);
+};
 
 const lastUse = new Map<string, number>();
 const approvedRooms = new Set<string>();
-let enforcingRoomPolicy = false;
+let enforcing = false;
 
-const RECEIPT_PATH = /\/rooms\/[^/]+\/(?:receipt\/|read_markers)/;
-const patchedClients = new WeakSet<object>();
-
-function isReceiptRequest(input: Parameters<typeof fetch>[0]): boolean {
-  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-  return RECEIPT_PATH.test(url);
-}
-
-const nativeFetch = globalThis.fetch.bind(globalThis);
-globalThis.fetch = (input, init) =>
-  isReceiptRequest(input) ? Promise.resolve(Response.json({})) : nativeFetch(input, init);
-
-interface InspiroImage {
+interface ImageFile {
   bytes: Uint8Array;
   mimetype: string;
   filename: string;
@@ -80,60 +67,88 @@ function escapeHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function acquireCooldown(roomId: string): boolean {
+// one reply per room per second, shared by every command
+function rateLimited(roomId: string): boolean {
   const now = Date.now();
-  if (now - (lastUse.get(roomId) ?? 0) < COOLDOWN_MS) return false;
+  if (now - (lastUse.get(roomId) ?? 0) < COOLDOWN_MS) return true;
   lastUse.set(roomId, now);
-  return true;
+  return false;
 }
 
-async function isRoomMuted(storage: DurableObjectStorage, roomId: string): Promise<boolean> {
-  return (await storage.get<boolean>(MUTE_KEY_PREFIX + roomId)) === true;
+async function getJson<T>(url: string): Promise<T> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as T;
 }
 
-async function setRoomMuted(storage: DurableObjectStorage, roomId: string, muted: boolean): Promise<void> {
-  if (muted) await storage.put(MUTE_KEY_PREFIX + roomId, true);
-  else await storage.delete(MUTE_KEY_PREFIX + roomId);
-}
+async function fetchInspiroImage(): Promise<ImageFile> {
+  const api = await fetch(INSPIRO_API_URL);
+  if (!api.ok) throw new Error(`inspirobot request failed: HTTP ${api.status}`);
 
-async function fetchInspiroImage(): Promise<InspiroImage> {
-  const apiResponse = await fetch(INSPIRO_API_URL);
-  if (!apiResponse.ok) throw new Error(`inspirobot request failed: HTTP ${apiResponse.status}`);
+  const url = (await api.text()).trim();
+  if (!url.startsWith('https://')) throw new Error(`unexpected inspirobot response: ${url.slice(0, 80)}`);
 
-  const imageUrl = (await apiResponse.text()).trim();
-  if (!imageUrl.startsWith('https://')) {
-    throw new Error(`unexpected inspirobot response: ${imageUrl.slice(0, 80)}`);
-  }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`image download failed: HTTP ${res.status}`);
 
-  const imageResponse = await fetch(imageUrl);
-  if (!imageResponse.ok) throw new Error(`image download failed: HTTP ${imageResponse.status}`);
-
-  const mimetype = imageResponse.headers.get('content-type')?.split(';')[0].trim() || 'image/jpeg';
-  const bytes = new Uint8Array(await imageResponse.arrayBuffer());
+  const bytes = new Uint8Array(await res.arrayBuffer());
   if (bytes.byteLength > MAX_IMAGE_BYTES) throw new Error(`image too large: ${bytes.byteLength} bytes`);
 
-  const extension = mimetype === 'image/png' ? 'png' : 'jpg';
-  return { bytes, mimetype, filename: `inspirobot.${extension}` };
+  const mimetype = res.headers.get('content-type')?.split(';')[0].trim() || 'image/jpeg';
+  return { bytes, mimetype, filename: `inspirobot.${mimetype === 'image/png' ? 'png' : 'jpg'}` };
 }
 
-async function fetchBunbunImage(assets: Fetcher): Promise<InspiroImage> {
-  const n = Math.floor(Math.random() * BUNBUN_COUNT) + 1; // 1..BUNBUN_COUNT
-  const filename = `bunbun-${n}.webp`;
-  // host is irrelevant, the assets binding only uses the path
-  const response = await assets.fetch(`https://assets.local/${filename}`);
-  if (!response.ok) throw new Error(`${filename} not found: HTTP ${response.status}`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  return { bytes, mimetype: 'image/webp', filename };
+async function fetchBunbunImage(assets: Fetcher): Promise<ImageFile> {
+  const filename = `bunbun-${Math.floor(Math.random() * BUNBUN_COUNT) + 1}.webp`;
+  // host doesn't matter, the assets binding only looks at the path
+  const res = await assets.fetch(`https://assets.local/${filename}`);
+  if (!res.ok) throw new Error(`${filename} not found: HTTP ${res.status}`);
+  return { bytes: new Uint8Array(await res.arrayBuffer()), mimetype: 'image/webp', filename };
+}
+
+async function fetchCatFact(): Promise<string> {
+  try {
+    const { fact } = await getJson<{ fact?: string }>(CATFACT_API_URL);
+    if (!fact) throw new Error('empty response');
+    return fact;
+  } catch (error) {
+    throw new Error(`could not get cat fact: ${errorMessage(error)}`);
+  }
+}
+
+async function fetchMeow(baseUrl?: string): Promise<string> {
+  if (!baseUrl) throw new Error('MEOW_BASE_URL is not set in wrangler.toml');
+  try {
+    const { meow } = await getJson<{ meow?: string }>(`${baseUrl.replace(/\/+$/, '')}/meow`);
+    if (!meow) throw new Error('empty response');
+    return `🐈 ${meow}`;
+  } catch (error) {
+    throw new Error(`meow service failed: ${errorMessage(error)}`);
+  }
+}
+
+function flipCoin(): string {
+  return `🪙 ${Math.random() < 0.5 ? 'heads' : 'tails'}`;
+}
+
+// every choice beats the one before it in the list (rock wraps around to scissors)
+function playRps(args: string[]): string {
+  const player = RPS_CHOICES.indexOf((args[0] ?? '').toLowerCase());
+  if (args.length !== 1 || player < 0) return RPS_USAGE;
+
+  const bot = Math.floor(Math.random() * RPS_CHOICES.length);
+  const result = ["it's a tie!", 'you win!', 'I win!'][(player - bot + 3) % 3];
+  return `you: ${RPS_EMOJI[player]} ${RPS_CHOICES[player]} | me: ${RPS_EMOJI[bot]} ${RPS_CHOICES[bot]} - ${result}`;
 }
 
 const DAY_MS = 86_400_000;
 const MAX_TIMESTAMP = 8_640_000_000_000_000;
-const RFC3339_PATTERN = /^\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})$/i;
-const RELATIVE_PATTERN =
-  /^(?:(\d+)\s*(?:days?|d))?\s*(?:(\d+)\s*(?:hours?|hrs?|h))?\s*(?:(\d+)\s*(?:minutes?|mins?|m))?\s*(?:(\d+)\s*(?:seconds?|secs?|s))?$/;
-const DATE_PATTERN = /^(?:(\d{4})-(\d{2})-(\d{2})|(\d{1,2})\/(\d{1,2})\/(\d{4}))$/;
-const CLOCK_PATTERN = /^(\d{1,2})[:.](\d{2})(?::(\d{2}))?$/;
+const RFC3339 = /^\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})$/i;
+const RELATIVE = /^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/;
+const ABSOLUTE = /^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2})(?::(\d{2}))?)?$/;
+const CLOCK = /^(\d{1,2}):(\d{2})$/;
 
+// null if the date doesn't exist (month 13, feb 30, 25:00...)
 function utcTimestamp(
   year: number,
   month: number,
@@ -156,65 +171,49 @@ function utcTimestamp(
 
 function parseWhen(input: string, now: number): number | null {
   const raw = input.trim();
-  if (RFC3339_PATTERN.test(raw)) {
+  if (RFC3339.test(raw)) {
     const parsed = Date.parse(raw.toUpperCase());
     return Number.isNaN(parsed) ? null : parsed;
   }
 
-  let value = raw.toLowerCase();
-  if (value.startsWith('in')) value = value.slice(2).trim();
-  if (!value) return null;
+  let text = raw.toLowerCase();
+  if (text.startsWith('in')) text = text.slice(2).trim();
+  if (!text) return null;
 
-  const relative = RELATIVE_PATTERN.exec(value);
+  const relative = RELATIVE.exec(text);
   if (relative) {
-    const [, days, hours, minutes, seconds] = relative;
-    const total =
-      (Number(days ?? 0) * 86_400 + Number(hours ?? 0) * 3_600 + Number(minutes ?? 0) * 60 + Number(seconds ?? 0)) *
-      1000;
-    const due = now + total;
-    if (total > 0 && due <= MAX_TIMESTAMP) return due;
+    const [days, hours, minutes, seconds] = relative.slice(1).map((n) => Number(n ?? 0));
+    const total = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+    if (total > 0 && now + total <= MAX_TIMESTAMP) return now + total;
   }
 
-  // "tomorrow", a date ("2026-01-02" or day/month/year like "01/11/2026") and/or a clock time ("15:04" or "15.04"),
-  // in any order: "15.04 01/11/2026", "tomorrow 09:00". "tomorrow" alone means the same time tomorrow.
-  let tomorrow = false;
-  let date: RegExpExecArray | null = null;
-  let clock: RegExpExecArray | null = null;
-  for (const word of value.split(/\s+/)) {
-    const dateMatch = DATE_PATTERN.exec(word);
-    const clockMatch = CLOCK_PATTERN.exec(word);
-    if (word === 'tomorrow' && !tomorrow && !date) tomorrow = true;
-    else if (dateMatch && !tomorrow && !date) date = dateMatch;
-    else if (clockMatch && !clock) clock = clockMatch;
-    else return null;
+  const absolute = ABSOLUTE.exec(text);
+  if (absolute) {
+    const [year, month, day, hour, minute, second] = absolute.slice(1).map((n) => Number(n ?? 0));
+    return utcTimestamp(year, month, day, hour, minute, second);
   }
 
-  const hour = Number(clock?.[1] ?? 0);
-  const minute = Number(clock?.[2] ?? 0);
-  const second = Number(clock?.[3] ?? 0);
-
-  if (date) {
-    const [year, month, day] = date[1] ? [date[1], date[2], date[3]] : [date[6], date[5], date[4]];
-    return utcTimestamp(Number(year), Number(month), Number(day), hour, minute, second);
+  const clock = CLOCK.exec(text);
+  if (clock) {
+    const today = new Date(now);
+    const timestamp = utcTimestamp(
+      today.getUTCFullYear(),
+      today.getUTCMonth() + 1,
+      today.getUTCDate(),
+      Number(clock[1]),
+      Number(clock[2]),
+      0,
+    );
+    if (timestamp === null) return null;
+    return timestamp > now ? timestamp : timestamp + DAY_MS;
   }
 
-  if (tomorrow && !clock) return now + DAY_MS;
-
-  const today = new Date(now);
-  const timestamp = utcTimestamp(
-    today.getUTCFullYear(),
-    today.getUTCMonth() + 1,
-    today.getUTCDate(),
-    hour,
-    minute,
-    second,
-  );
-  if (timestamp === null) return null;
-  return tomorrow || timestamp <= now ? timestamp + DAY_MS : timestamp;
+  return null;
 }
 
+// the time can be one word ("10m", "15:04") or two ("2026-01-02 15:04", "in 10m")
 function extractReminder(args: string[], now: number): { due: number; text: string } | null {
-  for (const size of [5, 4, 3, 2, 1]) {
+  for (const size of [2, 1]) {
     if (args.length < size) continue;
     const due = parseWhen(args.slice(0, size).join(' '), now);
     if (due !== null) return { due, text: args.slice(size).join(' ') };
@@ -224,49 +223,6 @@ function extractReminder(args: string[], now: number): { due: number; text: stri
 
 function formatUtc(timestamp: number): string {
   return `${new Date(timestamp).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
-}
-
-async function fetchCatFact(): Promise<string> {
-  try {
-    const response = await fetch(CATFACT_API_URL);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = (await response.json()) as { fact?: string };
-    if (!data.fact) throw new Error('empty response');
-    return data.fact;
-  } catch (error) {
-    throw new Error(`could not get cat fact: ${errorMessage(error)}`);
-  }
-}
-
-async function fetchMeow(baseUrl: string | undefined): Promise<string> {
-  if (!baseUrl) throw new Error('MEOW_BASE_URL is not set in wrangler.toml');
-  try {
-    const response = await fetch(`${baseUrl.replace(/\/+$/, '')}/meow`);
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data = (await response.json()) as { meow?: string };
-    if (!data.meow) throw new Error('empty response');
-    return `\u{1F408} ${data.meow}`;
-  } catch (error) {
-    throw new Error(`meow service failed: ${errorMessage(error)}`);
-  }
-}
-
-function flipCoin(): string {
-  return Math.random() < 0.5 ? '\u{1FA99} heads' : '\u{1FA99} tails';
-}
-
-function isRpsChoice(value: string | undefined): value is RpsChoice {
-  return RPS_CHOICES.some((choice) => choice === value);
-}
-
-function playRps(args: string[]): string {
-  const playerChoice = args[0]?.toLowerCase();
-  if (args.length !== 1 || !isRpsChoice(playerChoice)) return RPS_USAGE;
-
-  const botChoice = RPS_CHOICES[Math.floor(Math.random() * RPS_CHOICES.length)];
-  const result =
-    playerChoice === botChoice ? "it's a tie!" : RPS_BEATS[playerChoice] === botChoice ? 'you win!' : 'I win!';
-  return `you: ${RPS_EMOJI[playerChoice]} ${playerChoice} | me: ${RPS_EMOJI[botChoice]} ${botChoice} - ${result}`;
 }
 
 async function createReminder(
@@ -281,9 +237,7 @@ async function createReminder(
   const now = Date.now();
   const reminder = extractReminder(args, now);
   if (!reminder) {
-    throw new Error(
-      `couldn't parse time "${args[0]}" (try "in 2 hours", "tomorrow", "15.04 01/11/2026", or "2026-01-02 15:04")`,
-    );
+    throw new Error(`couldn't parse time "${args[0]}" (try "10m", "1d", "15:04", or "2026-01-02 15:04")`);
   }
   if (!reminder.text) return REMIND_USAGE;
   if (reminder.due <= now) throw new Error('that time is in the past, pick a future time');
@@ -293,20 +247,28 @@ async function createReminder(
   return `ok, I'll remind you at ${formatUtc(reminder.due)}`;
 }
 
+type ReminderRow = {
+  id: number;
+  room_id: string;
+  thread_id: string | null;
+  text: string;
+  attempts: number;
+  user_id: string | null;
+};
+
 export class ReminderStore extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.storage.sql.exec(
       'CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, due INTEGER NOT NULL, room_id TEXT NOT NULL, thread_id TEXT, text TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)',
     );
+    // user_id was added later, this fails when the column already exists
     try {
       ctx.storage.sql.exec('ALTER TABLE reminders ADD COLUMN user_id TEXT');
     } catch {}
   }
 
   async schedule(roomId: string, threadId: string | null, due: number, text: string, userId: string): Promise<void> {
-    const currentAlarm = await this.ctx.storage.getAlarm();
-    if (currentAlarm === null || due < currentAlarm) await this.ctx.storage.setAlarm(due);
     this.ctx.storage.sql.exec(
       'INSERT INTO reminders (due, room_id, thread_id, text, user_id) VALUES (?, ?, ?, ?, ?)',
       due,
@@ -315,24 +277,13 @@ export class ReminderStore extends DurableObject<Env> {
       text,
       userId,
     );
+    await this.scheduleNext();
   }
 
   async alarm(): Promise<void> {
     const sql = this.ctx.storage.sql;
     const now = Date.now();
-    const rows = sql
-      .exec<{
-        id: number;
-        room_id: string;
-        thread_id: string | null;
-        text: string;
-        attempts: number;
-        user_id: string | null;
-      }>(
-        'SELECT id, room_id, thread_id, text, attempts, user_id FROM reminders WHERE due <= ? ORDER BY due',
-        now,
-      )
-      .toArray();
+    const rows = sql.exec<ReminderRow>('SELECT * FROM reminders WHERE due <= ? ORDER BY due', now).toArray();
     const bot = getBot(this.env);
 
     for (const row of rows) {
@@ -369,7 +320,7 @@ export class MatrixBot extends MatrixBotDO {
   protected override async shouldJoinRoom(roomId: string, inviter: string): Promise<boolean> {
     if (!BOT_ADMINS.has(inviter)) {
       console.log(`Rejected invite to ${roomId} from unauthorized user: ${inviter}`);
-      return false; // declined here; enforceRoomPolicy() rejects the pending invite shortly after
+      return false; // enforceRoomPolicy() declines the pending invite
     }
     console.log(`Accepted invite to ${roomId} from trusted user: ${inviter}`);
     return true;
@@ -377,43 +328,28 @@ export class MatrixBot extends MatrixBotDO {
 
   async deliverReminder(roomId: string, threadId: string | null, text: string, userId: string | null): Promise<void> {
     await this.ensureStarted();
+    const thread = threadId ?? undefined;
     if (!userId) {
-      await this.sendNotice(roomId, `\u23f0 reminder: ${text}`, { threadId: threadId ?? undefined });
+      await this.sendNotice(roomId, `⏰ reminder: ${text}`, { threadId: thread });
       return;
     }
-    const mention = escapeHtml(userId);
-    await this.sendText(roomId, `${userId} \u23f0 reminder: ${text}`, {
-      threadId: threadId ?? undefined,
+    const user = escapeHtml(userId);
+    await this.sendText(roomId, `${userId} ⏰ reminder: ${text}`, {
+      threadId: thread,
       mentions: [userId],
-      formattedBody: `<a href="https://matrix.to/#/${mention}">${mention}</a> \u23f0 reminder: ${escapeHtml(text)}`,
+      formattedBody: `<a href="https://matrix.to/#/${user}">${user}</a> ⏰ reminder: ${escapeHtml(text)}`,
     });
   }
 
   protected override async onStarted(): Promise<void> {
-    this.blockReadReceipts();
     await this.enforceRoomPolicy();
   }
 
-  private blockReadReceipts(): void {
-    try {
-      const client = this.client;
-      if (!client || patchedClients.has(client)) return;
-      const options = client.http.opts as { fetchFn?: typeof fetch };
-      const upstream = options.fetchFn ?? globalThis.fetch.bind(globalThis);
-      options.fetchFn = (input, init) =>
-        isReceiptRequest(input) ? Promise.resolve(Response.json({})) : upstream(input, init);
-      patchedClients.add(client);
-    } catch (error) {
-      console.error('read receipt guard failed:', error);
-    }
-  }
-
-  // Keeps the bot only in rooms an admin invited it to: rejects pending invites from
-  // non-admins and leaves joined rooms whose inviter is not an admin. When the inviter is
-  // unknown (rooms joined before the SDK recorded it), the room stays only if an admin is in it.
+  // leaves rooms (and declines invites) that didn't come from an admin. if the inviter
+  // is unknown (joined before the sdk recorded it) the room stays as long as an admin is in it
   async enforceRoomPolicy(): Promise<void> {
-    if (enforcingRoomPolicy) return;
-    enforcingRoomPolicy = true;
+    if (enforcing) return;
+    enforcing = true;
     try {
       const rooms = this.ctx.storage.sql
         .exec<{ room_id: string; membership: string; inviter: string | null }>(
@@ -432,7 +368,7 @@ export class MatrixBot extends MatrixBotDO {
         }
       }
     } finally {
-      enforcingRoomPolicy = false;
+      enforcing = false;
     }
   }
 
@@ -445,59 +381,40 @@ export class MatrixBot extends MatrixBotDO {
   }
 
   protected override async onMessage(message: BotMessage): Promise<void> {
-    this.blockReadReceipts();
     if (message.msgtype !== 'm.text') return;
 
     const [prefix = '', subcommand = '', ...args] = (message.body ?? '').trim().split(/\s+/);
     if (prefix.toLowerCase() !== COMMAND_PREFIX) return;
+
     const command = subcommand.toLowerCase();
-
-    const { roomId } = message;
+    const { roomId, sender } = message;
     const threadId = message.threadRootId;
+    const muteKey = MUTE_KEY_PREFIX + roomId;
 
-    // Admin-only mute switch. Handled before the cooldown and mute checks so it always
-    // works, even while the room is being spammed.
+    // before the cooldown and mute checks so it always works
     if (command === 'mute' || command === 'unmute') {
-      if (!BOT_ADMINS.has(message.sender)) return;
-      await setRoomMuted(this.ctx.storage, roomId, command === 'mute');
+      if (!BOT_ADMINS.has(sender)) return;
+      if (command === 'mute') await this.ctx.storage.put(muteKey, true);
+      else await this.ctx.storage.delete(muteKey);
       return;
     }
 
-    // Single cooldown for every command: at most one reply per room per second.
-    if (!acquireCooldown(roomId)) return;
+    if (rateLimited(roomId) || (await this.ctx.storage.get(muteKey))) return;
 
-    // Muted rooms get no replies at all.
-    if (await isRoomMuted(this.ctx.storage, roomId)) return;
+    const reply = (text: string) => this.sendNotice(roomId, text, { threadId });
 
-    // Bare "!faith" or a mistyped/unknown subcommand: show the help text.
+    // bare "!faith" or a typo
     if (!KNOWN_COMMANDS.has(command)) {
-      await this.sendNotice(roomId, HELP_TEXT, { threadId }).catch(() => undefined);
+      await reply(HELP_TEXT).catch(() => {});
       return;
     }
-
     if (args.length > 0 && command !== 'remind' && command !== 'rps') return;
 
-    if (command === 'inspire') {
-      try {
-        const image = await fetchInspiroImage();
-        await this.sendFile(roomId, image.bytes, {
-          filename: image.filename,
-          mimetype: image.mimetype,
-          msgtype: 'm.image',
-          body: image.filename,
-          threadId,
-        });
-      } catch (error) {
-        console.error('inspire command failed:', error);
-        await this.sendNotice(roomId, "Couldn't generate the image.", { threadId }).catch(() => undefined);
-      }
-      return;
-    }
-
     const env = this.env as unknown as Env;
-    if (command === 'bunbun') {
+
+    const replyImage = async (load: () => Promise<ImageFile>, failure: string) => {
       try {
-        const image = await fetchBunbunImage(env.ASSETS);
+        const image = await load();
         await this.sendFile(roomId, image.bytes, {
           filename: image.filename,
           mimetype: image.mimetype,
@@ -506,40 +423,37 @@ export class MatrixBot extends MatrixBotDO {
           threadId,
         });
       } catch (error) {
-        console.error('bunbun command failed:', error);
-        await this.sendNotice(roomId, "Couldn't fetch image.", { threadId }).catch(() => undefined);
+        console.error(`${command} command failed:`, error);
+        await reply(failure).catch(() => {});
       }
-      return;
-    }
-    let run: () => string | Promise<string>;
-    switch (command) {
-      case 'help':
-        run = () => HELP_TEXT;
-        break;
-      case 'catfact':
-        run = fetchCatFact;
-        break;
-      case 'meow':
-        run = () => fetchMeow(env.MEOW_BASE_URL);
-        break;
-      case 'coinflip':
-        run = flipCoin;
-        break;
-      case 'rps':
-        run = () => playRps(args);
-        break;
-      case 'remind':
-        run = () => createReminder(env, roomId, threadId ?? null, args, message.sender);
-        break;
-      default:
-        return;
-    }
+    };
 
-    try {
-      await this.sendNotice(roomId, await run(), { threadId });
-    } catch (error) {
-      console.error(`${command} command failed:`, error);
-      await this.sendNotice(roomId, errorMessage(error), { threadId }).catch(() => undefined);
+    const replyText = async (run: () => string | Promise<string>) => {
+      try {
+        await reply(await run());
+      } catch (error) {
+        console.error(`${command} command failed:`, error);
+        await reply(errorMessage(error)).catch(() => {});
+      }
+    };
+
+    switch (command) {
+      case 'inspire':
+        return replyImage(fetchInspiroImage, "Couldn't generate the image.");
+      case 'bunbun':
+        return replyImage(() => fetchBunbunImage(env.ASSETS), "Couldn't fetch image.");
+      case 'catfact':
+        return replyText(fetchCatFact);
+      case 'meow':
+        return replyText(() => fetchMeow(env.MEOW_BASE_URL));
+      case 'coinflip':
+        return replyText(flipCoin);
+      case 'rps':
+        return replyText(() => playRps(args));
+      case 'remind':
+        return replyText(() => createReminder(env, roomId, threadId ?? null, args, sender));
+      default:
+        return replyText(() => HELP_TEXT);
     }
   }
 }
@@ -548,9 +462,6 @@ interface Env {
   BOT_DO: DurableObjectNamespace<MatrixBot>;
   REMINDER_DO: DurableObjectNamespace<ReminderStore>;
   MATRIX_PASSWORD?: string;
-  MATRIX_PROVISION_CRYPTO?: string;
-  MATRIX_RECOVERY_PASSPHRASE?: string;
-  MATRIX_RECOVERY_KEY?: string;
   MEOW_BASE_URL?: string;
   ASSETS: Fetcher;
 }
@@ -559,44 +470,31 @@ function getBot(env: Env) {
   return env.BOT_DO.get(env.BOT_DO.idFromName(BOT_INSTANCE_NAME));
 }
 
-function missingSecrets(env: Env): string[] {
-  const missing: string[] = [];
-  if (!env.MATRIX_PASSWORD) missing.push('MATRIX_PASSWORD');
-  const flag = env.MATRIX_PROVISION_CRYPTO;
-  const provision = flag !== undefined && flag !== '' && flag !== 'false' && flag !== '0';
-  if (provision && !env.MATRIX_RECOVERY_PASSPHRASE && !env.MATRIX_RECOVERY_KEY) {
-    missing.push('MATRIX_RECOVERY_PASSPHRASE');
-  }
-  return missing;
-}
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    if (new URL(request.url).pathname !== '/') {
-      return new Response('Not found', { status: 404 });
-    }
+    if (new URL(request.url).pathname !== '/') return new Response('Not found', { status: 404 });
 
-    const missing = missingSecrets(env);
-    if (missing.length > 0) {
-      console.error('missing secrets:', missing.join(', '));
+    if (!env.MATRIX_PASSWORD) {
+      console.error('MATRIX_PASSWORD is not set');
       return Response.json({ ok: false, error: 'missing_configuration' }, { status: 500 });
     }
 
     try {
-      const result = await getBot(env).ensureStarted();
-      return Response.json({ ok: true, started: result.started });
+      const { started } = await getBot(env).ensureStarted();
+      return Response.json({ ok: true, started });
     } catch (error) {
       console.error('bot failed to start:', error);
       return Response.json({ ok: false, error: 'start_failed' }, { status: 500 });
     }
   },
 
-  // Keep-alive only: wakes the Durable Object and makes sure the bot is running.
-  // Room policy is enforced from onStarted(), not from here.
+  // keeps the bot running and sweeps rooms it shouldn't be in
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    if (missingSecrets(env).length > 0) return;
+    if (!env.MATRIX_PASSWORD) return;
     try {
-      await getBot(env).ensureStarted();
+      const bot = getBot(env);
+      await bot.ensureStarted();
+      await bot.enforceRoomPolicy();
     } catch (error) {
       console.error('scheduled tick failed:', error);
     }
