@@ -121,7 +121,7 @@ async function fetchMeow(baseUrl?: string): Promise<string> {
   try {
     const { meow } = await getJson<{ meow?: string }>(`${baseUrl.replace(/\/+$/, '')}/meow`);
     if (!meow) throw new Error('empty response');
-    return `🐈 ${meow}`;
+    return `${meow}`;
   } catch (error) {
     throw new Error(`meow service failed: ${errorMessage(error)}`);
   }
