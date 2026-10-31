@@ -22,7 +22,18 @@ const BOT_ADMINS = new Set([
 ]);
 
 const COMMAND_PREFIX = '!faith';
-const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind', 'bunbun', 'coinflip', 'rps', 'xkcd']);
+const KNOWN_COMMANDS = new Set([
+  'help',
+  'inspire',
+  'catfact',
+  'meow',
+  'bark',
+  'remind',
+  'bunbun',
+  'coinflip',
+  'rps',
+  'xkcd',
+]);
 
 const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10 minutes | in 2 hours | in 3 days | 30/12/2026> <text...>`;
 const REMIND_CLEAR_USAGE = `usage: ${COMMAND_PREFIX} remind clear [all]`;
@@ -33,6 +44,7 @@ const HELP_COMMANDS = [
   ['inspire', 'random inspiring image'],
   ['catfact', 'random cat fact'],
   ['meow', 'random meow from 7w1 s meow api'],
+  ['bark', 'random bark from the bark api'],
   [
     'remind <when> <text>',
     'post a reminder in this room\nwhen: in 10 minutes, in 2 hours, in 3 days or 30/12/2026 (same time of day)',
@@ -163,6 +175,17 @@ async function fetchMeow(baseUrl?: string): Promise<string> {
     return `${meow}`;
   } catch (error) {
     throw new Error(`meow service failed: ${errorMessage(error)}`);
+  }
+}
+
+async function fetchBark(baseUrl?: string): Promise<string> {
+  if (!baseUrl) throw new Error('BARK_BASE_URL is not set in wrangler.toml');
+  try {
+    const { bark } = await getJson<{ bark?: string }>(`${baseUrl.replace(/\/+$/, '')}/bark`);
+    if (!bark) throw new Error('empty response');
+    return `${bark}`;
+  } catch (error) {
+    throw new Error(`bark service failed: ${errorMessage(error)}`);
   }
 }
 
@@ -487,6 +510,8 @@ export class MatrixBot extends MatrixBotDO {
         return replyText(fetchCatFact);
       case 'meow':
         return replyText(() => fetchMeow(env.MEOW_BASE_URL));
+      case 'bark':
+        return replyText(() => fetchBark(env.BARK_BASE_URL));
       case 'coinflip':
         return replyText(flipCoin);
       case 'rps':
@@ -505,6 +530,7 @@ interface Env {
   REMINDER_DO: DurableObjectNamespace<ReminderStore>;
   MATRIX_PASSWORD?: string;
   MEOW_BASE_URL?: string;
+  BARK_BASE_URL?: string;
   ASSETS: Fetcher;
 }
 
