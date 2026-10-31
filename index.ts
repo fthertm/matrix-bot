@@ -43,8 +43,8 @@ const UNKNOWN_COMMAND = `unknown command, type ${COMMAND_PREFIX} for the command
 const HELP_COMMANDS = [
   ['inspire', 'random inspiring image'],
   ['catfact', 'random cat fact'],
-  ['meow', 'random meow from 7w1 s meow api'],
-  ['bark', 'random bark from the bark api'],
+  ['meow', 'random meow from 7w1 s MaaS'],
+  ['bark', 'random bark from 7w1 s DaaS'],
   [
     'remind <when> <text>',
     'post a reminder in this room\nwhen: in 10 minutes, in 2 hours, in 3 days or 30/12/2026 (same time of day)',
