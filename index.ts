@@ -74,10 +74,85 @@ const RPS_EMOJI = ['🪨', '📄', '✂️'];
 
 // the bot never sends read receipts, those requests are answered locally
 const RECEIPT_PATH = /\/rooms\/[^/]+\/(?:receipt\/|read_markers)/;
+const SYNC_PATH = /\/_matrix\/client\/(?:v\d+|r0)\/sync$/;
+const BOT_USER_ID = '@lulz:federated.nexus'; // same as MATRIX_USER_ID in wrangler.toml
 const realFetch = globalThis.fetch.bind(globalThis);
-globalThis.fetch = (input, init) => {
+
+// typing, read receipts and presence wake every long-poll /sync for nothing, and on the
+// free plan each /sync is one of the 50 subrequests an invocation gets
+const slimFilters = new Map<string, string>();
+let slimLogged = false;
+
+const NOISY_TIMELINE = [
+  'm.reaction',
+  'm.room.redaction',
+  'm.room.name',
+  'm.room.topic',
+  'm.room.avatar',
+  'm.room.pinned_events',
+];
+
+function slimFilter(base: any): string {
+  const none = { not_types: ['*'] };
+  const filter = { ...base };
+  const room = filter.room ?? {};
+  filter.presence = { ...filter.presence, ...none };
+  filter.room = {
+    ...room,
+    ephemeral: { ...room.ephemeral, ...none },
+    account_data: { ...room.account_data, ...none },
+    timeline: { ...room.timeline, not_types: [...(room.timeline?.not_types ?? []), ...NOISY_TIMELINE] },
+  };
+  return JSON.stringify(filter);
+}
+
+async function slimSyncUrl(url: string, init?: RequestInit): Promise<string> {
+  const u = new URL(url);
+  if (!SYNC_PATH.test(u.pathname)) return url;
+
+  const current = u.searchParams.get('filter');
+  let slim: string | undefined;
+  if (!current) {
+    slim = slimFilter({});
+  } else if (current.startsWith('{')) {
+    slim = slimFilter(JSON.parse(current));
+  } else {
+    slim = slimFilters.get(current);
+    if (slim === undefined) {
+      slim = '';
+      try {
+        const auth = new Headers(init?.headers).get('authorization');
+        const stored = `${u.origin}/_matrix/client/v3/user/${encodeURIComponent(BOT_USER_ID)}/filter/${encodeURIComponent(current)}`;
+        const res = await realFetch(stored, auth ? { headers: { authorization: auth } } : undefined);
+        if (res.ok) {
+          slim = slimFilter(await res.json());
+        } else {
+          res.body?.cancel();
+          console.log(`sync filter: stored filter ${current} not readable (HTTP ${res.status})`);
+        }
+      } catch (error) {
+        console.log(`sync filter: stored filter ${current} not readable: ${errorMessage(error)}`);
+      }
+      slimFilters.set(current, slim);
+    }
+  }
+
+  if (!slim) return url;
+  if (!slimLogged) {
+    slimLogged = true;
+    console.log('sync filter: presence, typing and receipts are off');
+  }
+  u.searchParams.set('filter', slim);
+  return u.toString();
+}
+
+globalThis.fetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-  return RECEIPT_PATH.test(url) ? Promise.resolve(Response.json({})) : realFetch(input, init);
+  if (RECEIPT_PATH.test(url)) return Response.json({});
+
+  const slim = await slimSyncUrl(url, init).catch(() => url);
+  if (slim === url) return realFetch(input, init);
+  return realFetch(input instanceof Request ? new Request(slim, input) : slim, init);
 };
 
 const lastUse = new Map<string, number>();
@@ -88,7 +163,7 @@ interface ImageFile {
   bytes: Uint8Array;
   mimetype: string;
   filename: string;
-  caption?: string; // sent after the image
+  caption?: string;
 }
 
 function errorMessage(error: unknown): string {
@@ -99,7 +174,6 @@ function escapeHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// one reply per room per second, shared by every command
 function rateLimited(roomId: string): boolean {
   const now = Date.now();
   if (now - (lastUse.get(roomId) ?? 0) < COOLDOWN_MS) return true;
