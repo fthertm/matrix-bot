@@ -44,20 +44,18 @@ const HELP_COMMANDS = [
   ['help', 'show this message'],
 ];
 
-// plain text for clients that don't render html
-const HELP_TEXT = [
-  'Commands:',
-  ...HELP_COMMANDS.map(([usage, info]) => `${COMMAND_PREFIX} ${usage} - ${info.replace('\n', '. ')}`),
-].join('\n');
+const HELP_INTRO = `all commands start with ${COMMAND_PREFIX}`;
 
-// a list with the command on its own line reads better on a narrow screen
+// html clients get the table, the rest only see the intro (the event needs some body)
 const HELP_HTML =
-  '<b>Commands</b><ul>' +
+  `<p>${HELP_INTRO}</p><table><thead><tr><th>command</th><th>usage</th><th>what it does</th></tr></thead><tbody>` +
   HELP_COMMANDS.map(([usage, info]) => {
-    const command = escapeHtml(`${COMMAND_PREFIX} ${usage}`);
-    return `<li><code>${command}</code><br>${escapeHtml(info).replace(/\n/g, '<br>')}</li>`;
+    const [name] = usage.split(' ');
+    const full = escapeHtml(`${COMMAND_PREFIX} ${usage}`);
+    const what = escapeHtml(info).replace(/\n/g, '<br>');
+    return `<tr><td><code>${name}</code></td><td><code>${full}</code></td><td>${what}</td></tr>`;
   }).join('') +
-  '</ul>';
+  '</tbody></table>';
 
 const RPS_CHOICES = ['rock', 'paper', 'scissors'];
 const RPS_EMOJI = ['🪨', '📄', '✂️'];
@@ -133,7 +131,7 @@ async function fetchXkcdImage(): Promise<ImageFile> {
   let num = Math.floor(Math.random() * latest) + 1;
   if (num === 404) num++; // there is no xkcd 404, that's the joke
 
-  const comic = await getJson<{ safe_title: string; alt: string; img?: string }>(`${XKCD_URL}/${num}/info.0.json`);
+  const comic = await getJson<{ safe_title: string; img?: string }>(`${XKCD_URL}/${num}/info.0.json`);
   if (!comic.img?.startsWith('https://')) throw new Error(`xkcd ${num} has no image`);
 
   const res = await fetch(comic.img);
@@ -143,7 +141,7 @@ async function fetchXkcdImage(): Promise<ImageFile> {
   if (bytes.byteLength > MAX_IMAGE_BYTES) throw new Error(`image too large: ${bytes.byteLength} bytes`);
 
   const mimetype = res.headers.get('content-type')?.split(';')[0].trim() || 'image/png';
-  const caption = [`xkcd #${num}: ${comic.safe_title}`, comic.alt, `${XKCD_URL}/${num}/`].filter(Boolean).join('\n');
+  const caption = `xkcd #${num}: ${comic.safe_title}`;
   return { bytes, mimetype, filename: `xkcd-${num}.${mimetype.split('/')[1]}`, caption };
 }
 
@@ -441,7 +439,7 @@ export class MatrixBot extends MatrixBotDO {
     if (rateLimited(roomId) || (await this.ctx.storage.get(muteKey))) return;
 
     const reply = (text: string) => this.sendNotice(roomId, text, { threadId });
-    const replyHelp = () => this.sendNotice(roomId, HELP_TEXT, { threadId, formattedBody: HELP_HTML }).catch(() => {});
+    const replyHelp = () => this.sendNotice(roomId, HELP_INTRO, { threadId, formattedBody: HELP_HTML }).catch(() => {});
 
     // a typo gets a pointer to the command list, not the whole list
     if (command && !KNOWN_COMMANDS.has(command)) {
