@@ -5,6 +5,7 @@ const BOT_INSTANCE_NAME = 'Matrix-Bot';
 const REMINDER_INSTANCE_NAME = 'Reminders';
 const INSPIRO_API_URL = 'https://inspirobot.me/api?generate=true';
 const CATFACT_API_URL = 'https://catfact.ninja/fact';
+const XKCD_URL = 'https://xkcd.com';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const BUNBUN_COUNT = 16;
 const COOLDOWN_MS = 1_000;
@@ -21,22 +22,42 @@ const BOT_ADMINS = new Set([
 ]);
 
 const COMMAND_PREFIX = '!faith';
-const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind', 'bunbun', 'coinflip', 'rps']);
+const KNOWN_COMMANDS = new Set(['help', 'inspire', 'catfact', 'meow', 'remind', 'bunbun', 'coinflip', 'rps', 'xkcd']);
 
-const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10m | 2026-01-02 15:04 | 15:04> <text...>`;
+const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10 minutes | in 2 hours | in 3 days | 30/12/2026> <text...>`;
+const REMIND_CLEAR_USAGE = `usage: ${COMMAND_PREFIX} remind clear [all]`;
 const RPS_USAGE = `usage: ${COMMAND_PREFIX} rps <rock|paper|scissors>`;
+const UNKNOWN_COMMAND = `unknown command, type ${COMMAND_PREFIX} for the command list`;
 
+const HELP_COMMANDS = [
+  ['inspire', 'random inspiring image'],
+  ['catfact', 'random cat fact'],
+  ['meow', 'random meow from 7w1 s meow api'],
+  [
+    'remind <when> <text>',
+    'post a reminder in this room\nwhen: in 10 minutes, in 2 hours, in 3 days or 30/12/2026 (same time of day)',
+  ],
+  ['bunbun', 'random bunbun image'],
+  ['xkcd', 'random xkcd comic'],
+  ['coinflip', 'flip a coin'],
+  ['rps <rock|paper|scissors>', 'play rock paper scissors against the bot'],
+  ['help', 'show this message'],
+];
+
+// plain text for clients that don't render html
 const HELP_TEXT = [
   'Commands:',
-  `${COMMAND_PREFIX} inspire - random inspiring image`,
-  `${COMMAND_PREFIX} catfact - random cat fact`,
-  `${COMMAND_PREFIX} meow - random meow from 7w1 s meow api`,
-  `${COMMAND_PREFIX} remind <when> <text> - post a reminder in this room. <when>: 2026-01-02 15:04 (times are UTC)`,
-  `${COMMAND_PREFIX} bunbun - random bunbun image`,
-  `${COMMAND_PREFIX} coinflip - flip a coin`,
-  `${COMMAND_PREFIX} rps <rock|paper|scissors> - play rock paper scissors against the bot`,
-  `${COMMAND_PREFIX} help - show this message`,
+  ...HELP_COMMANDS.map(([usage, info]) => `${COMMAND_PREFIX} ${usage} - ${info.replace('\n', '. ')}`),
 ].join('\n');
+
+// a list with the command on its own line reads better on a narrow screen
+const HELP_HTML =
+  '<b>Commands</b><ul>' +
+  HELP_COMMANDS.map(([usage, info]) => {
+    const command = escapeHtml(`${COMMAND_PREFIX} ${usage}`);
+    return `<li><code>${command}</code><br>${escapeHtml(info).replace(/\n/g, '<br>')}</li>`;
+  }).join('') +
+  '</ul>';
 
 const RPS_CHOICES = ['rock', 'paper', 'scissors'];
 const RPS_EMOJI = ['🪨', '📄', '✂️'];
@@ -57,6 +78,7 @@ interface ImageFile {
   bytes: Uint8Array;
   mimetype: string;
   filename: string;
+  caption?: string; // sent after the image
 }
 
 function errorMessage(error: unknown): string {
@@ -106,6 +128,25 @@ async function fetchBunbunImage(assets: Fetcher): Promise<ImageFile> {
   return { bytes: new Uint8Array(await res.arrayBuffer()), mimetype: 'image/webp', filename };
 }
 
+async function fetchXkcdImage(): Promise<ImageFile> {
+  const { num: latest } = await getJson<{ num: number }>(`${XKCD_URL}/info.0.json`);
+  let num = Math.floor(Math.random() * latest) + 1;
+  if (num === 404) num++; // there is no xkcd 404, that's the joke
+
+  const comic = await getJson<{ safe_title: string; alt: string; img?: string }>(`${XKCD_URL}/${num}/info.0.json`);
+  if (!comic.img?.startsWith('https://')) throw new Error(`xkcd ${num} has no image`);
+
+  const res = await fetch(comic.img);
+  if (!res.ok) throw new Error(`image download failed: HTTP ${res.status}`);
+
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.byteLength > MAX_IMAGE_BYTES) throw new Error(`image too large: ${bytes.byteLength} bytes`);
+
+  const mimetype = res.headers.get('content-type')?.split(';')[0].trim() || 'image/png';
+  const caption = [`xkcd #${num}: ${comic.safe_title}`, comic.alt, `${XKCD_URL}/${num}/`].filter(Boolean).join('\n');
+  return { bytes, mimetype, filename: `xkcd-${num}.${mimetype.split('/')[1]}`, caption };
+}
+
 async function fetchCatFact(): Promise<string> {
   try {
     const { fact } = await getJson<{ fact?: string }>(CATFACT_API_URL);
@@ -143,10 +184,9 @@ function playRps(args: string[]): string {
 
 const DAY_MS = 86_400_000;
 const MAX_TIMESTAMP = 8_640_000_000_000_000;
-const RFC3339 = /^\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})$/i;
-const RELATIVE = /^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/;
-const ABSOLUTE = /^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2})(?::(\d{2}))?)?$/;
-const CLOCK = /^(\d{1,2}):(\d{2})$/;
+const RELATIVE = /^in (\d+) (minute|hour|day)s?$/;
+const ABSOLUTE = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/;
+const UNIT_MS = { minute: 60_000, hour: 3_600_000, day: DAY_MS };
 
 // null if the date doesn't exist (month 13, feb 30, 25:00...)
 function utcTimestamp(
@@ -170,59 +210,45 @@ function utcTimestamp(
 }
 
 function parseWhen(input: string, now: number): number | null {
-  const raw = input.trim();
-  if (RFC3339.test(raw)) {
-    const parsed = Date.parse(raw.toUpperCase());
-    return Number.isNaN(parsed) ? null : parsed;
-  }
-
-  let text = raw.toLowerCase();
-  if (text.startsWith('in')) text = text.slice(2).trim();
-  if (!text) return null;
+  const text = input.trim().toLowerCase();
 
   const relative = RELATIVE.exec(text);
   if (relative) {
-    const [days, hours, minutes, seconds] = relative.slice(1).map((n) => Number(n ?? 0));
-    const total = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+    const total = Number(relative[1]) * UNIT_MS[relative[2] as keyof typeof UNIT_MS];
     if (total > 0 && now + total <= MAX_TIMESTAMP) return now + total;
   }
 
+  // a date keeps the current time of day
   const absolute = ABSOLUTE.exec(text);
   if (absolute) {
-    const [year, month, day, hour, minute, second] = absolute.slice(1).map((n) => Number(n ?? 0));
-    return utcTimestamp(year, month, day, hour, minute, second);
-  }
-
-  const clock = CLOCK.exec(text);
-  if (clock) {
-    const today = new Date(now);
-    const timestamp = utcTimestamp(
-      today.getUTCFullYear(),
-      today.getUTCMonth() + 1,
-      today.getUTCDate(),
-      Number(clock[1]),
-      Number(clock[2]),
-      0,
-    );
-    if (timestamp === null) return null;
-    return timestamp > now ? timestamp : timestamp + DAY_MS;
+    const [day, month, year] = absolute.slice(1).map(Number);
+    const current = new Date(now);
+    return utcTimestamp(year, month, day, current.getUTCHours(), current.getUTCMinutes(), current.getUTCSeconds());
   }
 
   return null;
 }
 
-// the time can be one word ("10m", "15:04") or two ("2026-01-02 15:04", "in 10m")
-function extractReminder(args: string[], now: number): { due: number; text: string } | null {
-  for (const size of [2, 1]) {
+// the time can be one word ("30/12/2026") or three ("in 10 minutes")
+function extractReminder(args: string[], now: number): { due: number; text: string; when: string } | null {
+  for (const size of [3, 1]) {
     if (args.length < size) continue;
-    const due = parseWhen(args.slice(0, size).join(' '), now);
-    if (due !== null) return { due, text: args.slice(size).join(' ') };
+    const when = args.slice(0, size).join(' ');
+    const due = parseWhen(when, now);
+    if (due !== null) return { due, text: args.slice(size).join(' '), when };
   }
   return null;
 }
 
-function formatUtc(timestamp: number): string {
-  return `${new Date(timestamp).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+// admin only, drops the pending reminders of this room (or of every room with "all")
+async function clearReminders(env: Env, roomId: string, args: string[], userId: string): Promise<string> {
+  if (!BOT_ADMINS.has(userId)) return 'only bot admins can clear reminders';
+  const all = args[0]?.toLowerCase() === 'all';
+  if (args.length > 1 || (args.length === 1 && !all)) return REMIND_CLEAR_USAGE;
+
+  const store = env.REMINDER_DO.get(env.REMINDER_DO.idFromName(REMINDER_INSTANCE_NAME));
+  const count = await store.clear(all ? null : roomId);
+  return `cleared ${count} reminder${count === 1 ? '' : 's'}${all ? '' : ' in this room'}`;
 }
 
 async function createReminder(
@@ -232,19 +258,21 @@ async function createReminder(
   args: string[],
   userId: string,
 ): Promise<string> {
+  if (args[0]?.toLowerCase() === 'clear') return clearReminders(env, roomId, args.slice(1), userId);
   if (args.length < 2) return REMIND_USAGE;
 
   const now = Date.now();
   const reminder = extractReminder(args, now);
   if (!reminder) {
-    throw new Error(`couldn't parse time "${args[0]}" (try "10m", "1d", "15:04", or "2026-01-02 15:04")`);
+    throw new Error(`couldn't parse time "${args[0]}" (try "in 10 minutes" or "30/12/2026")`);
   }
   if (!reminder.text) return REMIND_USAGE;
   if (reminder.due <= now) throw new Error('that time is in the past, pick a future time');
 
   const store = env.REMINDER_DO.get(env.REMINDER_DO.idFromName(REMINDER_INSTANCE_NAME));
   await store.schedule(roomId, threadId, reminder.due, reminder.text, userId);
-  return `ok, I'll remind you at ${formatUtc(reminder.due)}`;
+  const when = reminder.when.toLowerCase();
+  return `ok, I'll remind you ${when.startsWith('in ') ? '' : 'on '}${when}`;
 }
 
 type ReminderRow = {
@@ -278,6 +306,17 @@ export class ReminderStore extends DurableObject<Env> {
       userId,
     );
     await this.scheduleNext();
+  }
+
+  // null clears every room
+  async clear(roomId: string | null): Promise<number> {
+    const sql = this.ctx.storage.sql;
+    const where = roomId === null ? '' : ' WHERE room_id = ?';
+    const params = roomId === null ? [] : [roomId];
+    const { count } = sql.exec<{ count: number }>(`SELECT COUNT(*) AS count FROM reminders${where}`, ...params).one();
+    sql.exec(`DELETE FROM reminders${where}`, ...params);
+    await this.scheduleNext();
+    return count;
   }
 
   async alarm(): Promise<void> {
@@ -402,10 +441,11 @@ export class MatrixBot extends MatrixBotDO {
     if (rateLimited(roomId) || (await this.ctx.storage.get(muteKey))) return;
 
     const reply = (text: string) => this.sendNotice(roomId, text, { threadId });
+    const replyHelp = () => this.sendNotice(roomId, HELP_TEXT, { threadId, formattedBody: HELP_HTML }).catch(() => {});
 
-    // bare "!faith" or a typo
-    if (!KNOWN_COMMANDS.has(command)) {
-      await reply(HELP_TEXT).catch(() => {});
+    // a typo gets a pointer to the command list, not the whole list
+    if (command && !KNOWN_COMMANDS.has(command)) {
+      await reply(UNKNOWN_COMMAND).catch(() => {});
       return;
     }
     if (args.length > 0 && command !== 'remind' && command !== 'rps') return;
@@ -422,6 +462,7 @@ export class MatrixBot extends MatrixBotDO {
           body: image.filename,
           threadId,
         });
+        if (image.caption) await reply(image.caption).catch(() => {});
       } catch (error) {
         console.error(`${command} command failed:`, error);
         await reply(failure).catch(() => {});
@@ -442,6 +483,8 @@ export class MatrixBot extends MatrixBotDO {
         return replyImage(fetchInspiroImage, "Couldn't generate the image.");
       case 'bunbun':
         return replyImage(() => fetchBunbunImage(env.ASSETS), "Couldn't fetch image.");
+      case 'xkcd':
+        return replyImage(fetchXkcdImage, "Couldn't fetch comic.");
       case 'catfact':
         return replyText(fetchCatFact);
       case 'meow':
@@ -453,7 +496,8 @@ export class MatrixBot extends MatrixBotDO {
       case 'remind':
         return replyText(() => createReminder(env, roomId, threadId ?? null, args, sender));
       default:
-        return replyText(() => HELP_TEXT);
+        // bare "!faith" or "!faith help"
+        return replyHelp();
     }
   }
 }
