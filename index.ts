@@ -16,7 +16,6 @@ const MUTE_KEY_PREFIX = 'faith:muted:';
 // can invite the bot and mute/unmute it
 const BOT_ADMINS = new Set([
   '@fatih:federated.nexus',
-  '@fatih:unredacted.org',
 ]);
 
 const COMMAND_PREFIX = '!faith';
