@@ -72,12 +72,22 @@ const HELP_HTML =
 const RPS_CHOICES = ['rock', 'paper', 'scissors'];
 const RPS_EMOJI = ['🪨', '📄', '✂️'];
 
+// workers free plan: 50 subrequests per invocation. the sdk runs the whole /sync loop inside one
+// keep-alive alarm (up to 5 min) and bills every fetch of the bot to it. once the budget is gone
+// every fetch fails until that alarm ends. so count fetches and end the alarm's hold early: the
+// alarm re-arms 1 s later with a fresh budget and the sync loop keeps running across the gap
+const SUBREQUEST_ROTATE_AT = 35;
+let subrequestCount = 0;
+let endAlarmHold: (() => void) | null = null;
+
 // the bot never sends read receipts, those requests are answered locally
 const RECEIPT_PATH = /\/rooms\/[^/]+\/(?:receipt\/|read_markers)/;
 const realFetch = globalThis.fetch.bind(globalThis);
 globalThis.fetch = (input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-  return RECEIPT_PATH.test(url) ? Promise.resolve(Response.json({})) : realFetch(input, init);
+  if (RECEIPT_PATH.test(url)) return Promise.resolve(Response.json({}));
+  if (++subrequestCount >= SUBREQUEST_ROTATE_AT) endAlarmHold?.();
+  return realFetch(input, init);
 };
 
 const lastUse = new Map<string, number>();
@@ -377,6 +387,19 @@ export class ReminderStore extends DurableObject<Env> {
 }
 
 export class MatrixBot extends MatrixBotDO {
+  override async alarm(): Promise<void> {
+    subrequestCount = 0; // new invocation, new budget
+    // releaseHold is private in the sdk (pinned to 0.7.0); it ends this alarm's hold window
+    const sdk = this as unknown as { releaseHold?: (() => void) | null };
+    if (!('releaseHold' in sdk)) console.warn('sdk changed: releaseHold is gone, subrequest rotation is off');
+    endAlarmHold = () => {
+      if (!sdk.releaseHold) return;
+      console.log(`rotating keep-alive alarm after ${subrequestCount} subrequests`);
+      sdk.releaseHold();
+    };
+    return super.alarm();
+  }
+
   protected override async shouldJoinRoom(roomId: string, inviter: string): Promise<boolean> {
     if (!BOT_ADMINS.has(inviter)) {
       console.log(`Rejected invite to ${roomId} from unauthorized user: ${inviter}`);
