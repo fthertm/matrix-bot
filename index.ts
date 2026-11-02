@@ -16,9 +16,7 @@ const MUTE_KEY_PREFIX = 'faith:muted:';
 // can invite the bot and mute/unmute it
 const BOT_ADMINS = new Set([
   '@fatih:federated.nexus',
-  '@usr40k:usr40k.dev',
-  '@angeline:matrix.anarchists.space',
-  '@cj:foxnet.systems',
+  '@fatih:unredacted.org,
 ]);
 
 const COMMAND_PREFIX = '!faith';
