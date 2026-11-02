@@ -25,7 +25,7 @@ MEOW_BASE_URL = "https://meow.plz.pet/"
 BARK_BASE_URL = "https://bark.plz.pet/"
 
 [triggers]
-crons = ["*/3 * * * *"]
+crons = ["*/30 * * * *"]
 
 [[durable_objects.bindings]]
 name = "BOT_DO"
