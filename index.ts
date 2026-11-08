@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
-import { MatrixBotDO, type BotMessage } from '@ixo/matrix-bot-workers-sdk';
+import { MatrixBotDO, type BotMessage, type BotTimelineEvent } from '@ixo/matrix-bot-workers-sdk';
 
 const BOT_INSTANCE_NAME = 'Matrix-Bot';
 const REMINDER_INSTANCE_NAME = 'Reminders';
@@ -12,6 +12,8 @@ const COOLDOWN_MS = 1_000;
 const REMINDER_MAX_ATTEMPTS = 5;
 const REMINDER_RETRY_MS = 10_000;
 const MUTE_KEY_PREFIX = 'faith:muted:';
+const ADMIN_CHECK_TTL_MS = 10 * 60_000; // how long "an admin is in this room" is trusted by the sweep
+const MEMBER_EVENT_THROTTLE_MS = 30_000; // min gap between leave-triggered checks of one room
 
 // can invite the bot and mute/unmute it
 const BOT_ADMINS = new Set([
@@ -35,6 +37,7 @@ const KNOWN_COMMANDS = new Set([
 
 const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10 minutes | in 2 hours | in 3 days | 30/12/2026> <text...>`;
 const REMIND_CLEAR_USAGE = `usage: ${COMMAND_PREFIX} remind clear [all]`;
+const KICK_USAGE = `usage: ${COMMAND_PREFIX} kick [room id] (without a room id the bot leaves this room)`;
 const RPS_USAGE = `usage: ${COMMAND_PREFIX} rps <rock|paper|scissors>`;
 const UNKNOWN_COMMAND = `unknown command, type ${COMMAND_PREFIX} for the command list`;
 
@@ -89,7 +92,8 @@ globalThis.fetch = (input, init) => {
 };
 
 const lastUse = new Map<string, number>();
-const approvedRooms = new Set<string>();
+const adminSeen = new Map<string, number>(); // room id -> time until which an admin presence is trusted
+const lastMemberCheck = new Map<string, number>();
 let enforcing = false;
 
 interface ImageFile {
@@ -426,8 +430,8 @@ export class MatrixBot extends MatrixBotDO {
     await this.enforceRoomPolicy();
   }
 
-  // leaves rooms (and declines invites) that didn't come from an admin. if the inviter
-  // is unknown (joined before the sdk recorded it) the room stays as long as an admin is in it
+  // the bot only stays in rooms where at least one admin is a member. invites that didn't
+  // come from an admin are declined (members of a room we haven't joined can't be checked)
   async enforceRoomPolicy(): Promise<void> {
     if (enforcing) return;
     enforcing = true;
@@ -440,11 +444,17 @@ export class MatrixBot extends MatrixBotDO {
 
       for (const { room_id: roomId, membership, inviter } of rooms) {
         try {
-          if (inviter && BOT_ADMINS.has(inviter)) continue;
-          if (membership === 'join' && !inviter && (await this.hasAdminMember(roomId))) continue;
-          console.log(`Leaving ${roomId} (${membership}): inviter is ${inviter || 'unknown'}, not an admin`);
+          if (membership === 'invite') {
+            if (inviter && BOT_ADMINS.has(inviter)) continue;
+            console.log(`Declining invite to ${roomId}: inviter is ${inviter || 'unknown'}, not an admin`);
+            await this.leaveRoom(roomId);
+            continue;
+          }
+          if (await this.hasAdminMember(roomId)) continue;
+          console.log(`Leaving ${roomId}: no admin in the room`);
           await this.leaveRoom(roomId);
         } catch (error) {
+          // when the member list can't be fetched the bot stays, a failed check never means "leave"
           console.error(`room policy check failed for ${roomId}:`, error);
         }
       }
@@ -453,12 +463,86 @@ export class MatrixBot extends MatrixBotDO {
     }
   }
 
-  private async hasAdminMember(roomId: string): Promise<boolean> {
-    if (approvedRooms.has(roomId)) return true;
+  // force skips the short-lived cache, used when something just changed in the room
+  private async hasAdminMember(roomId: string, force = false): Promise<boolean> {
+    if (!force && (adminSeen.get(roomId) ?? 0) > Date.now()) return true;
     const members = await this.getJoinedRoomMembers(roomId);
-    const found = members.some((userId) => BOT_ADMINS.has(userId));
-    if (found) approvedRooms.add(roomId);
-    return found;
+    if (!members.some((userId) => BOT_ADMINS.has(userId))) {
+      adminSeen.delete(roomId);
+      return false;
+    }
+    adminSeen.set(roomId, Date.now() + ADMIN_CHECK_TTL_MS);
+    return true;
+  }
+
+  // somebody left or got banned: if that was the last admin the bot leaves right away instead of
+  // waiting for the cron sweep. it's an extra, the sweep stays the safety net
+  protected override async onEvent(event: BotTimelineEvent): Promise<void> {
+    if (event.type !== 'm.room.member') return;
+    const membership = event.content['membership'];
+    if (membership !== 'leave' && membership !== 'ban') return;
+
+    const now = Date.now();
+    if (now - (lastMemberCheck.get(event.roomId) ?? 0) < MEMBER_EVENT_THROTTLE_MS) return;
+    lastMemberCheck.set(event.roomId, now);
+
+    try {
+      if (!(await this.getJoinedRooms()).includes(event.roomId)) return;
+      if (await this.hasAdminMember(event.roomId, true)) return;
+      console.log(`Leaving ${event.roomId}: the last admin is gone`);
+      await this.leaveRoom(event.roomId);
+    } catch (error) {
+      console.error(`member event check failed for ${event.roomId}:`, error);
+    }
+  }
+
+  // ids only, read from the sdk's own room table so it costs no subrequests
+  private async listRooms(currentRoomId: string): Promise<{ text: string; html: string }> {
+    const roomIds = await this.getJoinedRooms();
+    if (roomIds.length === 0) return { text: "I'm not in any room", html: "<p>I'm not in any room</p>" };
+
+    const header = `in ${roomIds.length} room${roomIds.length === 1 ? '' : 's'}:`;
+    const mark = (id: string) => (id === currentRoomId ? ' (this room)' : '');
+    const text = header + '\n' + roomIds.map((id, i) => `${i + 1}. ${id}${mark(id)}`).join('\n');
+    const html =
+      `<p>${header}</p><ol>` +
+      roomIds.map((id) => `<li><code>${escapeHtml(id)}</code>${mark(id)}</li>`).join('') +
+      '</ol>';
+    return { text, html };
+  }
+
+  // admin commands: they skip the cooldown and the mute (like mute/unmute) and non admins are ignored silently
+  private async handleAdminCommand(
+    command: 'rooms' | 'kick',
+    args: string[],
+    roomId: string,
+    threadId: string | undefined,
+  ): Promise<void> {
+    const reply = (text: string, formattedBody?: string) =>
+      this.sendNotice(roomId, text, { threadId, ...(formattedBody ? { formattedBody } : {}) });
+
+    try {
+      if (command === 'rooms') {
+        if (args.length > 0) return void (await reply(`usage: ${COMMAND_PREFIX} rooms`));
+        const { text, html } = await this.listRooms(roomId);
+        await reply(text, html);
+        return;
+      }
+
+      // kick: leave the given room, or this one when no room id is given
+      if (args.length > 1 || (args[0] && !args[0].startsWith('!'))) return void (await reply(KICK_USAGE));
+      const target = args[0] ?? roomId;
+      if (!(await this.getJoinedRooms()).includes(target)) return void (await reply("I'm not in that room"));
+
+      // the confirmation goes out first, once the bot has left it can't speak in the room anymore
+      if (target === roomId) await reply('bye 👋');
+      await this.leaveRoom(target);
+      adminSeen.delete(target);
+      if (target !== roomId) await reply(`left ${target}`);
+    } catch (error) {
+      console.error(`${command} command failed:`, error);
+      await reply(errorMessage(error)).catch(() => {});
+    }
   }
 
   protected override async onMessage(message: BotMessage): Promise<void> {
@@ -478,6 +562,12 @@ export class MatrixBot extends MatrixBotDO {
       if (command === 'mute') await this.ctx.storage.put(muteKey, true);
       else await this.ctx.storage.delete(muteKey);
       return;
+    }
+
+    // bot admins only
+    if (command === 'rooms' || command === 'kick') {
+      if (!BOT_ADMINS.has(sender)) return;
+      return this.handleAdminCommand(command, args, roomId, threadId);
     }
 
     if (rateLimited(roomId) || (await this.ctx.storage.get(muteKey))) return;
