@@ -5,6 +5,7 @@ const BOT_INSTANCE_NAME = 'Matrix-Bot';
 const REMINDER_INSTANCE_NAME = 'Reminders';
 const INSPIRO_API_URL = 'https://inspirobot.me/api?generate=true';
 const CATFACT_API_URL = 'https://catfact.ninja/fact';
+const OPSEC_API_URL = 'https://opsec.usr40k.dev/';
 const XKCD_URL = 'https://xkcd.com';
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 const BUNBUN_COUNT = 16;
@@ -12,14 +13,13 @@ const COOLDOWN_MS = 1_000;
 const REMINDER_MAX_ATTEMPTS = 5;
 const REMINDER_RETRY_MS = 10_000;
 const MUTE_KEY_PREFIX = 'faith:muted:';
+const OWN_DONE_PREFIX = 'faith:own-done:';
+const OWN_COMMAND_MAX_AGE_MS = 60_000; // own commands older than this are replays (restart, backfill), not new
 const ADMIN_CHECK_TTL_MS = 10 * 60_000; // how long "an admin is in this room" is trusted by the sweep
 const MEMBER_EVENT_THROTTLE_MS = 30_000; // min gap between leave-triggered checks of one room
 
-// can invite the bot and mute/unmute it
-const BOT_ADMINS = new Set([
-  '@fatih:federated.nexus',
-  '@fatih:misantropic.net',
-]);
+// the bot runs as this account, so this is also the account that can mute/unmute and kick it
+const BOT_ADMINS = new Set(['@fatih:matrix.anarchists.space']);
 
 const COMMAND_PREFIX = '!faith';
 const KNOWN_COMMANDS = new Set([
@@ -28,6 +28,7 @@ const KNOWN_COMMANDS = new Set([
   'catfact',
   'meow',
   'bark',
+  'opsec',
   'remind',
   'bunbun',
   'coinflip',
@@ -46,6 +47,7 @@ const HELP_COMMANDS = [
   ['catfact', 'random cat fact'],
   ['meow', 'random meow from 7w1 s MaaS'],
   ['bark', 'random bark from 7w1 s DaaS'],
+  ['opsec', 'random opsec level'],
   [
     'remind <when> <text>',
     'post a reminder in this room\nwhen: in 10 minutes, in 2 hours, in 3 days or 30/12/2026 (same time of day)',
@@ -176,6 +178,18 @@ async function fetchCatFact(): Promise<string> {
     return fact;
   } catch (error) {
     throw new Error(`could not get cat fact: ${errorMessage(error)}`);
+  }
+}
+
+// the service answers with json: { seed, numericSeed, mode, result, results: [result] }
+async function fetchOpsec(): Promise<string> {
+  try {
+    const { result, results } = await getJson<{ result?: string; results?: string[] }>(OPSEC_API_URL);
+    const text = (result ?? results?.[0] ?? '').trim();
+    if (!text) throw new Error('empty response');
+    return text;
+  } catch (error) {
+    throw new Error(`opsec service failed: ${errorMessage(error)}`);
   }
 }
 
@@ -405,7 +419,7 @@ export class MatrixBot extends MatrixBotDO {
   protected override async shouldJoinRoom(roomId: string, inviter: string): Promise<boolean> {
     if (!BOT_ADMINS.has(inviter)) {
       console.log(`Rejected invite to ${roomId} from unauthorized user: ${inviter}`);
-      return false; // enforceRoomPolicy() declines the pending invite
+      return false; // not joined automatically, the invite is left for the account owner to answer
     }
     console.log(`Accepted invite to ${roomId} from trusted user: ${inviter}`);
     return true;
@@ -430,26 +444,21 @@ export class MatrixBot extends MatrixBotDO {
     await this.enforceRoomPolicy();
   }
 
-  // the bot only stays in rooms where at least one admin is a member. invites that didn't
-  // come from an admin are declined (members of a room we haven't joined can't be checked)
+  // the bot only stays in rooms where at least one admin is a member. the bot is the admin's own
+  // account, so that holds for every room it is in. pending invites are left alone: they belong
+  // to the account owner and are not auto-declined
   async enforceRoomPolicy(): Promise<void> {
     if (enforcing) return;
     enforcing = true;
     try {
       const rooms = this.ctx.storage.sql
         .exec<{ room_id: string; membership: string; inviter: string | null }>(
-          "SELECT room_id, membership, inviter FROM bot_rooms WHERE membership IN ('join', 'invite')",
+          "SELECT room_id, membership, inviter FROM bot_rooms WHERE membership = 'join'",
         )
         .toArray();
 
-      for (const { room_id: roomId, membership, inviter } of rooms) {
+      for (const { room_id: roomId } of rooms) {
         try {
-          if (membership === 'invite') {
-            if (inviter && BOT_ADMINS.has(inviter)) continue;
-            console.log(`Declining invite to ${roomId}: inviter is ${inviter || 'unknown'}, not an admin`);
-            await this.leaveRoom(roomId);
-            continue;
-          }
           if (await this.hasAdminMember(roomId)) continue;
           console.log(`Leaving ${roomId}: no admin in the room`);
           await this.leaveRoom(roomId);
@@ -475,10 +484,12 @@ export class MatrixBot extends MatrixBotDO {
     return true;
   }
 
-  // somebody left or got banned: if that was the last admin the bot leaves right away instead of
-  // waiting for the cron sweep. it's an extra, the sweep stays the safety net
   protected override async onEvent(event: BotTimelineEvent): Promise<void> {
+    if (event.type === 'm.room.message') return this.handleOwnMessage(event);
     if (event.type !== 'm.room.member') return;
+
+    // somebody left or got banned: if that was the last admin the bot leaves right away instead of
+    // waiting for the cron sweep. it's an extra, the sweep stays the safety net
     const membership = event.content['membership'];
     if (membership !== 'leave' && membership !== 'ban') return;
 
@@ -496,40 +507,40 @@ export class MatrixBot extends MatrixBotDO {
     }
   }
 
-  // ids only, read from the sdk's own room table so it costs no subrequests
-  private async listRooms(currentRoomId: string): Promise<{ text: string; html: string }> {
-    const roomIds = await this.getJoinedRooms();
-    if (roomIds.length === 0) return { text: "I'm not in any room", html: "<p>I'm not in any room</p>" };
+  // the sdk drops messages sent by the bot's own account before onMessage. the bot runs as the
+  // admin's account, so commands typed by the admin are picked up here from the raw event instead.
+  // replies are m.notice, so the bot never reacts to its own answers
+  private async handleOwnMessage(event: BotTimelineEvent): Promise<void> {
+    const env = this.env as unknown as Env;
+    if (event.sender !== env.MATRIX_USER_ID) return;
 
-    const header = `in ${roomIds.length} room${roomIds.length === 1 ? '' : 's'}:`;
-    const mark = (id: string) => (id === currentRoomId ? ' (this room)' : '');
-    const text = header + '\n' + roomIds.map((id, i) => `${i + 1}. ${id}${mark(id)}`).join('\n');
-    const html =
-      `<p>${header}</p><ol>` +
-      roomIds.map((id) => `<li><code>${escapeHtml(id)}</code>${mark(id)}</li>`).join('') +
-      '</ol>';
-    return { text, html };
+    const { msgtype, body } = event.content;
+    if (msgtype !== 'm.text' || typeof body !== 'string') return;
+    if (!body.trimStart().toLowerCase().startsWith(COMMAND_PREFIX)) return;
+    if (Date.now() - event.ts > OWN_COMMAND_MAX_AGE_MS) return; // replayed after a restart or backfill
+
+    const doneKey = OWN_DONE_PREFIX + event.eventId;
+    if (await this.ctx.storage.get(doneKey)) return;
+    await this.ctx.storage.put(doneKey, event.ts);
+
+    await this.onMessage({
+      roomId: event.roomId,
+      sender: event.sender,
+      ts: event.ts,
+      body,
+      msgtype,
+      eventIds: [event.eventId],
+      content: event.content,
+      ...(event.threadRootId ? { threadRootId: event.threadRootId } : {}),
+    });
   }
 
-  // admin commands: they skip the cooldown and the mute (like mute/unmute) and non admins are ignored silently
-  private async handleAdminCommand(
-    command: 'rooms' | 'kick',
-    args: string[],
-    roomId: string,
-    threadId: string | undefined,
-  ): Promise<void> {
-    const reply = (text: string, formattedBody?: string) =>
-      this.sendNotice(roomId, text, { threadId, ...(formattedBody ? { formattedBody } : {}) });
+  // admin only: skips the cooldown and the mute (like mute/unmute), non admins are ignored silently
+  private async handleKick(args: string[], roomId: string, threadId: string | undefined): Promise<void> {
+    const reply = (text: string) => this.sendNotice(roomId, text, { threadId });
 
     try {
-      if (command === 'rooms') {
-        if (args.length > 0) return void (await reply(`usage: ${COMMAND_PREFIX} rooms`));
-        const { text, html } = await this.listRooms(roomId);
-        await reply(text, html);
-        return;
-      }
-
-      // kick: leave the given room, or this one when no room id is given
+      // leave the given room, or this one when no room id is given
       if (args.length > 1 || (args[0] && !args[0].startsWith('!'))) return void (await reply(KICK_USAGE));
       const target = args[0] ?? roomId;
       if (!(await this.getJoinedRooms()).includes(target)) return void (await reply("I'm not in that room"));
@@ -540,7 +551,7 @@ export class MatrixBot extends MatrixBotDO {
       adminSeen.delete(target);
       if (target !== roomId) await reply(`left ${target}`);
     } catch (error) {
-      console.error(`${command} command failed:`, error);
+      console.error('kick command failed:', error);
       await reply(errorMessage(error)).catch(() => {});
     }
   }
@@ -565,9 +576,9 @@ export class MatrixBot extends MatrixBotDO {
     }
 
     // bot admins only
-    if (command === 'rooms' || command === 'kick') {
+    if (command === 'kick') {
       if (!BOT_ADMINS.has(sender)) return;
-      return this.handleAdminCommand(command, args, roomId, threadId);
+      return this.handleKick(args, roomId, threadId);
     }
 
     if (rateLimited(roomId) || (await this.ctx.storage.get(muteKey))) return;
@@ -623,6 +634,8 @@ export class MatrixBot extends MatrixBotDO {
         return replyText(() => fetchMeow(env.MEOW_BASE_URL));
       case 'bark':
         return replyText(() => fetchBark(env.BARK_BASE_URL));
+      case 'opsec':
+        return replyText(fetchOpsec);
       case 'coinflip':
         return replyText(flipCoin);
       case 'rps':
@@ -639,6 +652,7 @@ export class MatrixBot extends MatrixBotDO {
 interface Env {
   BOT_DO: DurableObjectNamespace<MatrixBot>;
   REMINDER_DO: DurableObjectNamespace<ReminderStore>;
+  MATRIX_USER_ID: string;
   MATRIX_PASSWORD?: string;
   MEOW_BASE_URL?: string;
   BARK_BASE_URL?: string;
