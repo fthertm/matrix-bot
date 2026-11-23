@@ -16,8 +16,8 @@ binding = "ASSETS"
 run_worker_first = true
 
 [vars]
-MATRIX_HOMESERVER_URL = "https://matrix.federated.nexus"
-MATRIX_USER_ID = "@lulz:federated.nexus"
+MATRIX_HOMESERVER_URL = "https://matrix.anarchists.space"
+MATRIX_USER_ID = "@fatih:matrix.anarchists.space"
 MATRIX_DEVICE_DISPLAY_NAME = "matrix-bot"
 MATRIX_BACKFILL_MAX_EVENTS = "20"
 LOG_LEVEL = "info"
