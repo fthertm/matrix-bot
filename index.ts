@@ -15,11 +15,6 @@ const REMINDER_RETRY_MS = 10_000;
 const MUTE_KEY_PREFIX = 'faith:muted:';
 const OWN_DONE_PREFIX = 'faith:own-done:';
 const OWN_COMMAND_MAX_AGE_MS = 60_000; // own commands older than this are replays (restart, backfill), not new
-const ADMIN_CHECK_TTL_MS = 10 * 60_000; // how long "an admin is in this room" is trusted by the sweep
-const MEMBER_EVENT_THROTTLE_MS = 30_000; // min gap between leave-triggered checks of one room
-
-// the bot runs as this account, so this is also the account that can mute/unmute and kick it
-const BOT_ADMINS = new Set(['@fatih:matrix.anarchists.space']);
 
 const COMMAND_PREFIX = '!faith';
 const KNOWN_COMMANDS = new Set([
@@ -38,7 +33,6 @@ const KNOWN_COMMANDS = new Set([
 
 const REMIND_USAGE = `usage: ${COMMAND_PREFIX} remind <in 10 minutes | in 2 hours | in 3 days | 30/12/2026> <text...>`;
 const REMIND_CLEAR_USAGE = `usage: ${COMMAND_PREFIX} remind clear [all]`;
-const KICK_USAGE = `usage: ${COMMAND_PREFIX} kick [room id] (without a room id the bot leaves this room)`;
 const RPS_USAGE = `usage: ${COMMAND_PREFIX} rps <rock|paper|scissors>`;
 const UNKNOWN_COMMAND = `unknown command, type ${COMMAND_PREFIX} for the command list`;
 
@@ -94,9 +88,6 @@ globalThis.fetch = (input, init) => {
 };
 
 const lastUse = new Map<string, number>();
-const adminSeen = new Map<string, number>(); // room id -> time until which an admin presence is trusted
-const lastMemberCheck = new Map<string, number>();
-let enforcing = false;
 
 interface ImageFile {
   bytes: Uint8Array;
@@ -127,21 +118,24 @@ async function getJson<T>(url: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-async function fetchInspiroImage(): Promise<ImageFile> {
-  const api = await fetch(INSPIRO_API_URL);
-  if (!api.ok) throw new Error(`inspirobot request failed: HTTP ${api.status}`);
-
-  const url = (await api.text()).trim();
-  if (!url.startsWith('https://')) throw new Error(`unexpected inspirobot response: ${url.slice(0, 80)}`);
-
+async function downloadImage(url: string, fallbackMime: string, name: string): Promise<ImageFile> {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`image download failed: HTTP ${res.status}`);
 
   const bytes = new Uint8Array(await res.arrayBuffer());
   if (bytes.byteLength > MAX_IMAGE_BYTES) throw new Error(`image too large: ${bytes.byteLength} bytes`);
 
-  const mimetype = res.headers.get('content-type')?.split(';')[0].trim() || 'image/jpeg';
-  return { bytes, mimetype, filename: `inspirobot.${mimetype === 'image/png' ? 'png' : 'jpg'}` };
+  const mimetype = res.headers.get('content-type')?.split(';')[0].trim() || fallbackMime;
+  return { bytes, mimetype, filename: `${name}.${mimetype.split('/')[1]}` };
+}
+
+async function fetchInspiroImage(): Promise<ImageFile> {
+  const api = await fetch(INSPIRO_API_URL);
+  if (!api.ok) throw new Error(`inspirobot request failed: HTTP ${api.status}`);
+
+  const url = (await api.text()).trim();
+  if (!url.startsWith('https://')) throw new Error(`unexpected inspirobot response: ${url.slice(0, 80)}`);
+  return downloadImage(url, 'image/jpeg', 'inspirobot');
 }
 
 async function fetchBunbunImage(assets: Fetcher): Promise<ImageFile> {
@@ -160,15 +154,8 @@ async function fetchXkcdImage(): Promise<ImageFile> {
   const comic = await getJson<{ safe_title: string; img?: string }>(`${XKCD_URL}/${num}/info.0.json`);
   if (!comic.img?.startsWith('https://')) throw new Error(`xkcd ${num} has no image`);
 
-  const res = await fetch(comic.img);
-  if (!res.ok) throw new Error(`image download failed: HTTP ${res.status}`);
-
-  const bytes = new Uint8Array(await res.arrayBuffer());
-  if (bytes.byteLength > MAX_IMAGE_BYTES) throw new Error(`image too large: ${bytes.byteLength} bytes`);
-
-  const mimetype = res.headers.get('content-type')?.split(';')[0].trim() || 'image/png';
-  const caption = `xkcd #${num}: ${comic.safe_title}`;
-  return { bytes, mimetype, filename: `xkcd-${num}.${mimetype.split('/')[1]}`, caption };
+  const image = await downloadImage(comic.img, 'image/png', `xkcd-${num}`);
+  return { ...image, caption: `xkcd #${num}: ${comic.safe_title}` };
 }
 
 async function fetchCatFact(): Promise<string> {
@@ -193,25 +180,15 @@ async function fetchOpsec(): Promise<string> {
   }
 }
 
-async function fetchMeow(baseUrl?: string): Promise<string> {
-  if (!baseUrl) throw new Error('MEOW_BASE_URL is not set in wrangler.toml');
+// meow and bark services: GET <base>/<kind> -> { <kind>: string }
+async function fetchPet(kind: 'meow' | 'bark', baseUrl?: string): Promise<string> {
+  if (!baseUrl) throw new Error(`${kind.toUpperCase()}_BASE_URL is not set in wrangler.toml`);
   try {
-    const { meow } = await getJson<{ meow?: string }>(`${baseUrl.replace(/\/+$/, '')}/meow`);
-    if (!meow) throw new Error('empty response');
-    return `${meow}`;
+    const data = await getJson<Record<string, string | undefined>>(`${baseUrl.replace(/\/+$/, '')}/${kind}`);
+    if (!data[kind]) throw new Error('empty response');
+    return data[kind];
   } catch (error) {
-    throw new Error(`meow service failed: ${errorMessage(error)}`);
-  }
-}
-
-async function fetchBark(baseUrl?: string): Promise<string> {
-  if (!baseUrl) throw new Error('BARK_BASE_URL is not set in wrangler.toml');
-  try {
-    const { bark } = await getJson<{ bark?: string }>(`${baseUrl.replace(/\/+$/, '')}/bark`);
-    if (!bark) throw new Error('empty response');
-    return `${bark}`;
-  } catch (error) {
-    throw new Error(`bark service failed: ${errorMessage(error)}`);
+    throw new Error(`${kind} service failed: ${errorMessage(error)}`);
   }
 }
 
@@ -287,14 +264,17 @@ function extractReminder(args: string[], now: number): { due: number; text: stri
   return null;
 }
 
+function getReminderStore(env: Env) {
+  return env.REMINDER_DO.get(env.REMINDER_DO.idFromName(REMINDER_INSTANCE_NAME));
+}
+
 // admin only, drops the pending reminders of this room (or of every room with "all")
 async function clearReminders(env: Env, roomId: string, args: string[], userId: string): Promise<string> {
-  if (!BOT_ADMINS.has(userId)) return 'only bot admins can clear reminders';
+  if (userId !== env.MATRIX_USER_ID) return 'only bot admins can clear reminders';
   const all = args[0]?.toLowerCase() === 'all';
   if (args.length > 1 || (args.length === 1 && !all)) return REMIND_CLEAR_USAGE;
 
-  const store = env.REMINDER_DO.get(env.REMINDER_DO.idFromName(REMINDER_INSTANCE_NAME));
-  const count = await store.clear(all ? null : roomId);
+  const count = await getReminderStore(env).clear(all ? null : roomId);
   return `cleared ${count} reminder${count === 1 ? '' : 's'}${all ? '' : ' in this room'}`;
 }
 
@@ -316,8 +296,7 @@ async function createReminder(
   if (!reminder.text) return REMIND_USAGE;
   if (reminder.due <= now) throw new Error('that time is in the past, pick a future time');
 
-  const store = env.REMINDER_DO.get(env.REMINDER_DO.idFromName(REMINDER_INSTANCE_NAME));
-  await store.schedule(roomId, threadId, reminder.due, reminder.text, userId);
+  await getReminderStore(env).schedule(roomId, threadId, reminder.due, reminder.text, userId);
   const when = reminder.when.toLowerCase();
   return `ok, I'll remind you ${when.startsWith('in ') ? '' : 'on '}${when}`;
 }
@@ -416,13 +395,13 @@ export class MatrixBot extends MatrixBotDO {
     return super.alarm();
   }
 
-  protected override async shouldJoinRoom(roomId: string, inviter: string): Promise<boolean> {
-    if (!BOT_ADMINS.has(inviter)) {
-      console.log(`Rejected invite to ${roomId} from unauthorized user: ${inviter}`);
-      return false; // not joined automatically, the invite is left for the account owner to answer
-    }
-    console.log(`Accepted invite to ${roomId} from trusted user: ${inviter}`);
-    return true;
+  private get cfg(): Env {
+    return this.env as unknown as Env;
+  }
+
+  // the bot is the owner's own account: invites are never auto-joined, they stay pending for the owner
+  protected override async shouldJoinRoom(): Promise<boolean> {
+    return false;
   }
 
   async deliverReminder(roomId: string, threadId: string | null, text: string, userId: string | null): Promise<void> {
@@ -440,79 +419,11 @@ export class MatrixBot extends MatrixBotDO {
     });
   }
 
-  protected override async onStarted(): Promise<void> {
-    await this.enforceRoomPolicy();
-  }
-
-  // the bot only stays in rooms where at least one admin is a member. the bot is the admin's own
-  // account, so that holds for every room it is in. pending invites are left alone: they belong
-  // to the account owner and are not auto-declined
-  async enforceRoomPolicy(): Promise<void> {
-    if (enforcing) return;
-    enforcing = true;
-    try {
-      const rooms = this.ctx.storage.sql
-        .exec<{ room_id: string; membership: string; inviter: string | null }>(
-          "SELECT room_id, membership, inviter FROM bot_rooms WHERE membership = 'join'",
-        )
-        .toArray();
-
-      for (const { room_id: roomId } of rooms) {
-        try {
-          if (await this.hasAdminMember(roomId)) continue;
-          console.log(`Leaving ${roomId}: no admin in the room`);
-          await this.leaveRoom(roomId);
-        } catch (error) {
-          // when the member list can't be fetched the bot stays, a failed check never means "leave"
-          console.error(`room policy check failed for ${roomId}:`, error);
-        }
-      }
-    } finally {
-      enforcing = false;
-    }
-  }
-
-  // force skips the short-lived cache, used when something just changed in the room
-  private async hasAdminMember(roomId: string, force = false): Promise<boolean> {
-    if (!force && (adminSeen.get(roomId) ?? 0) > Date.now()) return true;
-    const members = await this.getJoinedRoomMembers(roomId);
-    if (!members.some((userId) => BOT_ADMINS.has(userId))) {
-      adminSeen.delete(roomId);
-      return false;
-    }
-    adminSeen.set(roomId, Date.now() + ADMIN_CHECK_TTL_MS);
-    return true;
-  }
-
-  protected override async onEvent(event: BotTimelineEvent): Promise<void> {
-    if (event.type === 'm.room.message') return this.handleOwnMessage(event);
-    if (event.type !== 'm.room.member') return;
-
-    // somebody left or got banned: if that was the last admin the bot leaves right away instead of
-    // waiting for the cron sweep. it's an extra, the sweep stays the safety net
-    const membership = event.content['membership'];
-    if (membership !== 'leave' && membership !== 'ban') return;
-
-    const now = Date.now();
-    if (now - (lastMemberCheck.get(event.roomId) ?? 0) < MEMBER_EVENT_THROTTLE_MS) return;
-    lastMemberCheck.set(event.roomId, now);
-
-    try {
-      if (!(await this.getJoinedRooms()).includes(event.roomId)) return;
-      if (await this.hasAdminMember(event.roomId, true)) return;
-      console.log(`Leaving ${event.roomId}: the last admin is gone`);
-      await this.leaveRoom(event.roomId);
-    } catch (error) {
-      console.error(`member event check failed for ${event.roomId}:`, error);
-    }
-  }
-
   // the sdk drops messages sent by the bot's own account before onMessage. the bot runs as the
   // admin's account, so commands typed by the admin are picked up here from the raw event instead.
   // replies are m.notice, so the bot never reacts to its own answers
-  private async handleOwnMessage(event: BotTimelineEvent): Promise<void> {
-    const env = this.env as unknown as Env;
-    if (event.sender !== env.MATRIX_USER_ID) return;
+  protected override async onEvent(event: BotTimelineEvent): Promise<void> {
+    if (event.type !== 'm.room.message' || event.sender !== this.cfg.MATRIX_USER_ID) return;
 
     const { msgtype, body } = event.content;
     if (msgtype !== 'm.text' || typeof body !== 'string') return;
@@ -535,27 +446,6 @@ export class MatrixBot extends MatrixBotDO {
     });
   }
 
-  // admin only: skips the cooldown and the mute (like mute/unmute), non admins are ignored silently
-  private async handleKick(args: string[], roomId: string, threadId: string | undefined): Promise<void> {
-    const reply = (text: string) => this.sendNotice(roomId, text, { threadId });
-
-    try {
-      // leave the given room, or this one when no room id is given
-      if (args.length > 1 || (args[0] && !args[0].startsWith('!'))) return void (await reply(KICK_USAGE));
-      const target = args[0] ?? roomId;
-      if (!(await this.getJoinedRooms()).includes(target)) return void (await reply("I'm not in that room"));
-
-      // the confirmation goes out first, once the bot has left it can't speak in the room anymore
-      if (target === roomId) await reply('bye 👋');
-      await this.leaveRoom(target);
-      adminSeen.delete(target);
-      if (target !== roomId) await reply(`left ${target}`);
-    } catch (error) {
-      console.error('kick command failed:', error);
-      await reply(errorMessage(error)).catch(() => {});
-    }
-  }
-
   protected override async onMessage(message: BotMessage): Promise<void> {
     if (message.msgtype !== 'm.text') return;
 
@@ -566,25 +456,19 @@ export class MatrixBot extends MatrixBotDO {
     const { roomId, sender } = message;
     const threadId = message.threadRootId;
     const muteKey = MUTE_KEY_PREFIX + roomId;
+    const env = this.cfg;
 
-    // before the cooldown and mute checks so it always works
+    // admin (the bot's own account) only, before the cooldown and mute checks so it always works
     if (command === 'mute' || command === 'unmute') {
-      if (!BOT_ADMINS.has(sender)) return;
+      if (sender !== env.MATRIX_USER_ID) return;
       if (command === 'mute') await this.ctx.storage.put(muteKey, true);
       else await this.ctx.storage.delete(muteKey);
       return;
     }
 
-    // bot admins only
-    if (command === 'kick') {
-      if (!BOT_ADMINS.has(sender)) return;
-      return this.handleKick(args, roomId, threadId);
-    }
-
     if (rateLimited(roomId) || (await this.ctx.storage.get(muteKey))) return;
 
     const reply = (text: string) => this.sendNotice(roomId, text, { threadId });
-    const replyHelp = () => this.sendNotice(roomId, HELP_INTRO, { threadId, formattedBody: HELP_HTML }).catch(() => {});
 
     // a typo gets a pointer to the command list, not the whole list
     if (command && !KNOWN_COMMANDS.has(command)) {
@@ -592,8 +476,6 @@ export class MatrixBot extends MatrixBotDO {
       return;
     }
     if (args.length > 0 && command !== 'remind' && command !== 'rps') return;
-
-    const env = this.env as unknown as Env;
 
     const replyImage = async (load: () => Promise<ImageFile>, failure: string) => {
       try {
@@ -631,9 +513,9 @@ export class MatrixBot extends MatrixBotDO {
       case 'catfact':
         return replyText(fetchCatFact);
       case 'meow':
-        return replyText(() => fetchMeow(env.MEOW_BASE_URL));
+        return replyText(() => fetchPet('meow', env.MEOW_BASE_URL));
       case 'bark':
-        return replyText(() => fetchBark(env.BARK_BASE_URL));
+        return replyText(() => fetchPet('bark', env.BARK_BASE_URL));
       case 'opsec':
         return replyText(fetchOpsec);
       case 'coinflip':
@@ -644,7 +526,7 @@ export class MatrixBot extends MatrixBotDO {
         return replyText(() => createReminder(env, roomId, threadId ?? null, args, sender));
       default:
         // bare "!faith" or "!faith help"
-        return replyHelp();
+        return void (await this.sendNotice(roomId, HELP_INTRO, { threadId, formattedBody: HELP_HTML }).catch(() => {}));
     }
   }
 }
@@ -678,18 +560,6 @@ export default {
     } catch (error) {
       console.error('bot failed to start:', error);
       return Response.json({ ok: false, error: 'start_failed' }, { status: 500 });
-    }
-  },
-
-  // keeps the bot running and sweeps rooms it shouldn't be in
-  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    if (!env.MATRIX_PASSWORD) return;
-    try {
-      const bot = getBot(env);
-      await bot.ensureStarted();
-      await bot.enforceRoomPolicy();
-    } catch (error) {
-      console.error('scheduled tick failed:', error);
     }
   },
 };
