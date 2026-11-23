@@ -72,9 +72,11 @@ const RPS_EMOJI = ['🪨', '📄', '✂️'];
 // workers free plan: 50 subrequests per invocation. the sdk runs the whole /sync loop inside one
 // keep-alive alarm (up to 5 min) and bills every fetch of the bot to it. once the budget is gone
 // every fetch fails until that alarm ends. so count fetches and end the alarm's hold early: the
-// alarm re-arms 1 s later with a fresh budget and the sync loop keeps running across the gap
+// alarm re-arms 1 s later with a fresh budget and the sync loop keeps running across the gap.
+// subrequestPaths records which endpoints use the budget, it is logged on every rotation
 const SUBREQUEST_ROTATE_AT = 35;
 let subrequestCount = 0;
+let subrequestPaths = new Map<string, number>();
 let endAlarmHold: (() => void) | null = null;
 
 // the bot never sends read receipts, those requests are answered locally
@@ -83,11 +85,20 @@ const realFetch = globalThis.fetch.bind(globalThis);
 globalThis.fetch = (input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
   if (RECEIPT_PATH.test(url)) return Promise.resolve(Response.json({}));
+
+  let path = url;
+  try {
+    path = new URL(url).pathname.replace(/\/(?:[!$#][^/]+|[A-Za-z0-9_-]{20,})/g, '/:id');
+  } catch {}
+  subrequestPaths.set(path, (subrequestPaths.get(path) ?? 0) + 1);
+
   if (++subrequestCount >= SUBREQUEST_ROTATE_AT) endAlarmHold?.();
   return realFetch(input, init);
 };
 
 const lastUse = new Map<string, number>();
+// room id -> is the room end-to-end encrypted (the bot only works in unencrypted rooms)
+const encryptedRooms = new Map<string, boolean>();
 
 interface ImageFile {
   bytes: Uint8Array;
@@ -381,15 +392,20 @@ export class ReminderStore extends DurableObject<Env> {
   }
 }
 
+// invites, invite sweeps and room upgrade following are switched off with MATRIX_AUTOJOIN,
+// MATRIX_INVITE_SWEEP and MATRIX_FOLLOW_ROOM_UPGRADES in wrangler.toml, so invites stay pending
+// for the owner. being kicked or banned is only recorded by the sdk, it never tries to rejoin
 export class MatrixBot extends MatrixBotDO {
   override async alarm(): Promise<void> {
-    subrequestCount = 0; // new invocation, new budget
+    // new invocation, new budget
+    subrequestCount = 0;
+    subrequestPaths = new Map();
     // releaseHold is private in the sdk (pinned to 0.7.0); it ends this alarm's hold window
     const sdk = this as unknown as { releaseHold?: (() => void) | null };
     if (!('releaseHold' in sdk)) console.warn('sdk changed: releaseHold is gone, subrequest rotation is off');
     endAlarmHold = () => {
       if (!sdk.releaseHold) return;
-      console.log(`rotating keep-alive alarm after ${subrequestCount} subrequests`);
+      console.log(`rotating keep-alive alarm after ${subrequestCount} subrequests`, JSON.stringify([...subrequestPaths]));
       sdk.releaseHold();
     };
     return super.alarm();
@@ -399,9 +415,18 @@ export class MatrixBot extends MatrixBotDO {
     return this.env as unknown as Env;
   }
 
-  // the bot is the owner's own account: invites are never auto-joined, they stay pending for the owner
-  protected override async shouldJoinRoom(): Promise<boolean> {
-    return false;
+  // the bot only works in rooms without end-to-end encryption. unknown counts as encrypted
+  private async isEncrypted(roomId: string): Promise<boolean> {
+    const cached = encryptedRooms.get(roomId);
+    if (cached !== undefined) return cached;
+    try {
+      const encrypted = await this.isRoomEncrypted(roomId);
+      encryptedRooms.set(roomId, encrypted);
+      return encrypted;
+    } catch (error) {
+      console.error(`encryption check failed for ${roomId}:`, error);
+      return true;
+    }
   }
 
   async deliverReminder(roomId: string, threadId: string | null, text: string, userId: string | null): Promise<void> {
@@ -424,6 +449,7 @@ export class MatrixBot extends MatrixBotDO {
   // replies are m.notice, so the bot never reacts to its own answers
   protected override async onEvent(event: BotTimelineEvent): Promise<void> {
     if (event.type !== 'm.room.message' || event.sender !== this.cfg.MATRIX_USER_ID) return;
+    if (event.encrypted) return; // encrypted rooms are not supported
 
     const { msgtype, body } = event.content;
     if (msgtype !== 'm.text' || typeof body !== 'string') return;
@@ -452,8 +478,10 @@ export class MatrixBot extends MatrixBotDO {
     const [prefix = '', subcommand = '', ...args] = (message.body ?? '').trim().split(/\s+/);
     if (prefix.toLowerCase() !== COMMAND_PREFIX) return;
 
-    const command = subcommand.toLowerCase();
     const { roomId, sender } = message;
+    if (await this.isEncrypted(roomId)) return; // encrypted rooms are not supported, stay silent
+
+    const command = subcommand.toLowerCase();
     const threadId = message.threadRootId;
     const muteKey = MUTE_KEY_PREFIX + roomId;
     const env = this.cfg;
