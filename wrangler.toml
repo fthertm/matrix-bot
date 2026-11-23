@@ -24,9 +24,6 @@ LOG_LEVEL = "info"
 MEOW_BASE_URL = "https://meow.plz.pet/"
 BARK_BASE_URL = "https://bark.plz.pet/"
 
-[triggers]
-crons = ["*/30 * * * *"]
-
 [[durable_objects.bindings]]
 name = "BOT_DO"
 class_name = "MatrixBot"
