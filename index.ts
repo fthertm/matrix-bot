@@ -16,6 +16,13 @@ const MUTE_KEY_PREFIX = 'faith:muted:';
 const OWN_DONE_PREFIX = 'faith:own-done:';
 const OWN_COMMAND_MAX_AGE_MS = 60_000; // own commands older than this are replays (restart, backfill), not new
 
+// the bot only works in these rooms, every other room is ignored and left out of /sync (see restrictSync).
+// add room ids like '!abc123:matrix.anarchists.space' (element: room settings > advanced > internal room ID)
+// and redeploy. an empty list means the bot is off everywhere
+const ALLOWED_ROOMS = new Set<string>([
+  // '!abc123:matrix.anarchists.space',
+]);
+
 const COMMAND_PREFIX = '!faith';
 const KNOWN_COMMANDS = new Set([
   'help',
@@ -79,12 +86,41 @@ let subrequestCount = 0;
 let subrequestPaths = new Map<string, number>();
 let endAlarmHold: (() => void) | null = null;
 
+// the sdk's /sync asks for every joined room. narrow its filter to ALLOWED_ROOMS so the homeserver
+// never sends (and the bot never decrypts) events of other rooms. to-device events (room keys),
+// account data and invites are not affected by the room filter and keep coming
+function restrictSync(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (!parsed.pathname.endsWith('/_matrix/client/v3/sync')) return url;
+
+    const raw = parsed.searchParams.get('filter');
+    if (!raw) return url;
+
+    const filter = JSON.parse(raw) as { room?: { rooms?: string[] } };
+    // the very first sync of an account already excludes every room to only get a token, leave it alone
+    if (Array.isArray(filter.room?.rooms) && filter.room.rooms.length === 0) return url;
+
+    filter.room = { ...filter.room, rooms: [...ALLOWED_ROOMS] };
+    parsed.searchParams.set('filter', JSON.stringify(filter));
+    return parsed.href;
+  } catch {
+    return url;
+  }
+}
+
 // the bot never sends read receipts, those requests are answered locally
 const RECEIPT_PATH = /\/rooms\/[^/]+\/(?:receipt\/|read_markers)/;
 const realFetch = globalThis.fetch.bind(globalThis);
 globalThis.fetch = (input, init) => {
-  const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  let url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
   if (RECEIPT_PATH.test(url)) return Promise.resolve(Response.json({}));
+
+  // the sdk builds its /sync url as a string
+  if (typeof input === 'string') {
+    url = restrictSync(url);
+    input = url;
+  }
 
   let path = url;
   try {
@@ -449,6 +485,7 @@ export class MatrixBot extends MatrixBotDO {
   // replies are m.notice, so the bot never reacts to its own answers
   protected override async onEvent(event: BotTimelineEvent): Promise<void> {
     if (event.type !== 'm.room.message' || event.sender !== this.cfg.MATRIX_USER_ID) return;
+    if (!ALLOWED_ROOMS.has(event.roomId)) return; // rooms are opt-in, see ALLOWED_ROOMS
     if (event.encrypted) return; // encrypted rooms are not supported
 
     const { msgtype, body } = event.content;
@@ -479,6 +516,7 @@ export class MatrixBot extends MatrixBotDO {
     if (prefix.toLowerCase() !== COMMAND_PREFIX) return;
 
     const { roomId, sender } = message;
+    if (!ALLOWED_ROOMS.has(roomId)) return; // rooms are opt-in, see ALLOWED_ROOMS
     if (await this.isEncrypted(roomId)) return; // encrypted rooms are not supported, stay silent
 
     const command = subcommand.toLowerCase();
@@ -563,7 +601,7 @@ interface Env {
   BOT_DO: DurableObjectNamespace<MatrixBot>;
   REMINDER_DO: DurableObjectNamespace<ReminderStore>;
   MATRIX_USER_ID: string;
-  MATRIX_PASSWORD?: string;
+  MATRIX_ACCESS_TOKEN?: string;
   MEOW_BASE_URL?: string;
   BARK_BASE_URL?: string;
   ASSETS: Fetcher;
@@ -577,8 +615,8 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     if (new URL(request.url).pathname !== '/') return new Response('Not found', { status: 404 });
 
-    if (!env.MATRIX_PASSWORD) {
-      console.error('MATRIX_PASSWORD is not set');
+    if (!env.MATRIX_ACCESS_TOKEN) {
+      console.error('MATRIX_ACCESS_TOKEN is not set');
       return Response.json({ ok: false, error: 'missing_configuration' }, { status: 500 });
     }
 
