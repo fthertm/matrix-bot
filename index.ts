@@ -20,7 +20,8 @@ const OWN_COMMAND_MAX_AGE_MS = 60_000; // own commands older than this are repla
 // add room ids like '!abc123:matrix.anarchists.space' (element: room settings > advanced > internal room ID)
 // and redeploy. an empty list means the bot is off everywhere
 const ALLOWED_ROOMS = new Set<string>([
-  // '!abc123:matrix.anarchists.space',
+  '!oKrNYIxMa8hJdtFS4cFKeYrsKlM_5oNKoB827vpQIh8:matrix.anarchists.space',
+  '!cIFO6eKQooxxFnGQFVze9DII_HV9e3K4yUS5vsMBkr8:matrix.anarchists.space'
 ]);
 
 const COMMAND_PREFIX = '!faith';
@@ -51,7 +52,7 @@ const HELP_COMMANDS = [
   ['opsec', 'random opsec level'],
   [
     'remind <when> <text>',
-    'post a reminder in this room\nwhen: in 10 minutes, in 2 hours, in 3 days or 30/12/2026 (same time of day)',
+    'usage remind in x minutes, in x hours, in x days or 30/12/2026 (same time of day)',
   ],
   ['bunbun', 'random bunbun image'],
   ['xkcd', 'random xkcd comic'],
